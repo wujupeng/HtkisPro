@@ -6,6 +6,25 @@
 #include <cstring>
 #include <string_view>
 
+#ifdef _WIN32
+#include <windows.h>
+static std::string AnsiToUtf8(const std::string& ansi) {
+    if (ansi.empty()) return ansi;
+    int wlen = MultiByteToWideChar(CP_ACP, 0, ansi.c_str(), -1, nullptr, 0);
+    if (wlen <= 0) return ansi;
+    std::wstring wide(wlen, 0);
+    MultiByteToWideChar(CP_ACP, 0, ansi.c_str(), -1, &wide[0], wlen);
+    int ulen = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (ulen <= 0) return ansi;
+    std::string utf8(ulen, 0);
+    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, &utf8[0], ulen, nullptr, nullptr);
+    utf8.resize(ulen - 1);
+    return utf8;
+}
+#else
+static std::string AnsiToUtf8(const std::string& s) { return s; }
+#endif
+
 using asio::ip::tcp;
 
 // Helper: format bytes to human-readable
@@ -71,7 +90,7 @@ void Session::do_handshake() {
                     handle_socks5_handshake(length);
                 }
             } else {
-                Logger::getInstance().warn("[HANDSHAKE] Read error from " + m_client_addr + ": " + ec.message());
+                Logger::getInstance().warn("[HANDSHAKE] Read error from " + m_client_addr + ": " + AnsiToUtf8(ec.message()));
                 close_session("handshake error");
             }
         });
@@ -424,7 +443,7 @@ void Session::do_resolve(const std::string& host, uint16_t port) {
                 Logger::getInstance().info("[DNS] Resolved " + host + " -> " + std::to_string(results.size()) + " endpoint(s)");
                 do_connect(results);
             } else {
-                Logger::getInstance().error("[" + std::string(m_is_http ? "HTTP" : "SOCKS5") + "] DNS resolve failed: " + host + " - " + ec.message());
+                Logger::getInstance().error("[" + std::string(m_is_http ? "HTTP" : "SOCKS5") + "] DNS resolve failed: " + host + " - " + AnsiToUtf8(ec.message()));
                 if (m_is_http) {
                     auto response = std::make_shared<std::string>("HTTP/1.1 502 Bad Gateway\r\n\r\n");
                     asio::async_write(m_client_socket, asio::buffer(*response),
@@ -483,7 +502,7 @@ void Session::do_connect(const tcp::resolver::results_type& endpoints) {
                         });
                 }
             } else {
-                Logger::getInstance().error("[" + std::string(m_is_http ? "HTTP" : "SOCKS5") + "] Connect failed: " + m_target_host + ":" + std::to_string(m_target_port) + " - " + ec.message());
+                Logger::getInstance().error("[" + std::string(m_is_http ? "HTTP" : "SOCKS5") + "] Connect failed: " + m_target_host + ":" + std::to_string(m_target_port) + " - " + AnsiToUtf8(ec.message()));
                 if (m_is_http) {
                     auto response = std::make_shared<std::string>("HTTP/1.1 502 Bad Gateway\r\n\r\n");
                     asio::async_write(m_client_socket, asio::buffer(*response),

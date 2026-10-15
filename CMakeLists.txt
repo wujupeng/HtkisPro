@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(MSVC)
     add_compile_options(/utf-8 /W3)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 endif()
 
 include(FetchContent)
@@ -37,8 +38,8 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(imgui)
 
-# Find OpenGL
-find_package(OpenGL REQUIRED)
+# Find OpenGL (optional, D3D11 fallback available)
+find_package(OpenGL)
 
 set(IMGUI_SOURCES
     ${imgui_SOURCE_DIR}/imgui.cpp
@@ -48,6 +49,8 @@ set(IMGUI_SOURCES
     ${imgui_SOURCE_DIR}/imgui_demo.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp
 )
 
 # Server executable (the only program)
@@ -78,7 +81,11 @@ target_compile_definitions(proxy_server PRIVATE ASIO_STANDALONE)
 if(MSVC)
     target_link_options(proxy_server PRIVATE /ENTRY:mainCRTStartup /SUBSYSTEM:WINDOWS)
 endif()
-target_link_libraries(proxy_server PRIVATE glfw OpenGL32)
+target_link_libraries(proxy_server PRIVATE glfw)
+if(OpenGL_FOUND)
+    target_link_libraries(proxy_server PRIVATE OpenGL32)
+    target_compile_definitions(proxy_server PRIVATE HAS_OPENGL)
+endif()
 if(WIN32)
-    target_link_libraries(proxy_server PRIVATE gdiplus)
+    target_link_libraries(proxy_server PRIVATE gdiplus d3d11 dxgi d3dcompiler)
 endif()

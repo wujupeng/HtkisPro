@@ -6,11 +6,21 @@
 #include <gdiplus.h>
 #pragma comment(lib, "gdiplus.lib")
 #include "resource.h"
+#include <d3d11.h>
+#include <dxgi.h>
+#include <d3dcompiler.h>
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "d3dcompiler.lib")
 #endif
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
+#ifdef _WIN32
+#include "imgui_impl_win32.h"
+#include "imgui_impl_dx11.h"
+#endif
 #include <stdio.h>
 #define GL_SILENCE_DEPRECATION
 #include <GLFW/glfw3.h>
@@ -27,8 +37,17 @@
 // ===== Global State =====
 static GLFWwindow* g_window = nullptr;
 static bool g_shouldExit = false;
+static bool g_useD3D11 = false;
 
 #ifdef _WIN32
+// ===== D3D11 State =====
+static HWND g_d3d11Hwnd = nullptr;
+static ID3D11Device* g_d3dDevice = nullptr;
+static ID3D11DeviceContext* g_d3dContext = nullptr;
+static IDXGISwapChain* g_swapChain = nullptr;
+static ID3D11RenderTargetView* g_mainRenderTargetView = nullptr;
+static bool g_d3d11WindowVisible = true;
+
 // ===== System Tray =====
 #define WM_TRAYICON (WM_USER + 1)
 static NOTIFYICONDATAW g_nid = {};
@@ -55,7 +74,6 @@ static std::wstring GetExeDir() {
 
 // Load Gdiplus::Bitmap from embedded resource, fallback to file
 static Gdiplus::Bitmap* LoadBitmapFromResourceOrFile(const std::wstring& fallbackPath) {
-    // Try embedded resource first
     HRSRC hRes = FindResourceA(NULL, MAKEINTRESOURCEA(IDR_PNG_LOGO), RT_RCDATA);
     if (hRes) {
         HGLOBAL hData = LoadResource(NULL, hRes);
@@ -63,7 +81,6 @@ static Gdiplus::Bitmap* LoadBitmapFromResourceOrFile(const std::wstring& fallbac
             DWORD size = SizeofResource(NULL, hRes);
             void* pData = LockResource(hData);
             if (pData && size > 0) {
-                // Create IStream from resource data
                 HGLOBAL hCopy = GlobalAlloc(GMEM_MOVEABLE, size);
                 if (hCopy) {
                     void* pCopy = GlobalLock(hCopy);
@@ -83,7 +100,6 @@ static Gdiplus::Bitmap* LoadBitmapFromResourceOrFile(const std::wstring& fallbac
             }
         }
     }
-    // Fallback: load from file
     Gdiplus::Bitmap* bitmap = Gdiplus::Bitmap::FromFile(fallbackPath.c_str());
     if (bitmap && bitmap->GetLastStatus() == Gdiplus::Ok) {
         return bitmap;
@@ -117,27 +133,31 @@ static bool SetGLFWWindowIcon(const std::wstring& path, GLFWwindow* window) {
         delete bitmap;
         return false;
     }
-    // Convert BGRA -> RGBA
     std::vector<uint8_t> rgba(w * h * 4);
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
             uint8_t* src = (uint8_t*)bd.Scan0 + y * bd.Stride + x * 4;
             uint8_t* dst = rgba.data() + (y * w + x) * 4;
-            dst[0] = src[2]; // R
-            dst[1] = src[1]; // G
-            dst[2] = src[0]; // B
-            dst[3] = src[3]; // A
+            dst[0] = src[2]; dst[1] = src[1]; dst[2] = src[0]; dst[3] = src[3];
         }
     }
     bitmap->UnlockBits(&bd);
     delete bitmap;
-
     GLFWimage image;
-    image.width = w;
-    image.height = h;
-    image.pixels = rgba.data();
+    image.width = w; image.height = h; image.pixels = rgba.data();
     glfwSetWindowIcon(window, 1, &image);
     return true;
+}
+
+static void ShowMainWindow() {
+    if (g_useD3D11 && g_d3d11Hwnd) {
+        ShowWindow(g_d3d11Hwnd, SW_SHOW);
+        SetForegroundWindow(g_d3d11Hwnd);
+        g_d3d11WindowVisible = true;
+    } else if (g_window) {
+        glfwShowWindow(g_window);
+        glfwFocusWindow(g_window);
+    }
 }
 
 static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -156,15 +176,14 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, NULL);
             DestroyMenu(hMenu);
             if (cmd == 1) {
-                glfwShowWindow(g_window);
-                glfwFocusWindow(g_window);
+                ShowMainWindow();
             } else if (cmd == 2) {
                 g_shouldExit = true;
-                glfwPostEmptyEvent();
+                if (g_useD3D11 && g_d3d11Hwnd) PostMessage(g_d3d11Hwnd, WM_NULL, 0, 0);
+                else if (g_window) glfwPostEmptyEvent();
             }
         } else if (LOWORD(lp) == WM_LBUTTONDBLCLK) {
-            glfwShowWindow(g_window);
-            glfwFocusWindow(g_window);
+            ShowMainWindow();
         }
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -176,10 +195,8 @@ static void InitTray(HICON hIcon) {
     wc.hInstance = GetModuleHandleW(NULL);
     wc.lpszClassName = L"HtkisProTrayClass";
     RegisterClassW(&wc);
-
     g_hwndTray = CreateWindowW(L"HtkisProTrayClass", L"", 0, 0, 0, 0, 0,
         HWND_MESSAGE, NULL, GetModuleHandleW(NULL), NULL);
-
     g_nid.cbSize = sizeof(g_nid);
     g_nid.hWnd = g_hwndTray;
     g_nid.uID = 1;
@@ -203,6 +220,51 @@ static void ProcessTrayMessages() {
         DispatchMessageW(&msg);
     }
 }
+
+// ===== D3D11 Backend =====
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+static void CreateRenderTarget() {
+    ID3D11Texture2D* pBackBuffer = nullptr;
+    g_swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (LPVOID*)&pBackBuffer);
+    if (pBackBuffer) {
+        g_d3dDevice->CreateRenderTargetView(pBackBuffer, NULL, &g_mainRenderTargetView);
+        pBackBuffer->Release();
+    }
+}
+
+static void CleanupRenderTarget() {
+    if (g_mainRenderTargetView) { g_mainRenderTargetView->Release(); g_mainRenderTargetView = nullptr; }
+}
+
+static LRESULT CALLBACK D3D11WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
+        return true;
+    switch (msg) {
+    case WM_SIZE:
+        if (g_d3dDevice && wParam != SIZE_MINIMIZED) {
+            CleanupRenderTarget();
+            g_swapChain->ResizeBuffers(0, (UINT)LOWORD(lParam), (UINT)HIWORD(lParam), DXGI_FORMAT_UNKNOWN, 0);
+            CreateRenderTarget();
+        }
+        return 0;
+    case WM_CLOSE:
+        ShowWindow(hWnd, SW_HIDE);
+        g_d3d11WindowVisible = false;
+        return 0;
+    case WM_SYSCOMMAND:
+        if ((wParam & 0xfff0) == SC_MINIMIZE) {
+            ShowWindow(hWnd, SW_HIDE);
+            g_d3d11WindowVisible = false;
+            return 0;
+        }
+        break;
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProc(hWnd, msg, wParam, lParam);
+}
 #endif // _WIN32
 
 // ===== GLFW Callbacks =====
@@ -211,7 +273,6 @@ static void glfw_error_callback(int error, const char* description) {
 }
 
 static void window_close_callback(GLFWwindow* window) {
-    // Hide to tray instead of closing
     glfwSetWindowShouldClose(window, GLFW_FALSE);
     glfwHideWindow(window);
 }
@@ -228,39 +289,61 @@ void LoadFonts() {
     builder.AddRanges(io.Fonts->GetGlyphRangesVietnamese());
     builder.BuildRanges(&ranges);
 
-    const char* font_candidates[] = {
 #ifdef _WIN32
+    // Load primary font (Chinese + Latin), then merge Thai and Vietnamese fonts
+    const char* primary_fonts[] = {
         "C:\\Windows\\Fonts\\msyh.ttc",
         "C:\\Windows\\Fonts\\simhei.ttf",
         "C:\\Windows\\Fonts\\simsun.ttc",
-        "C:\\Windows\\Fonts\\arialuni.ttf",
+    };
+    bool loaded = false;
+    for (const char* fp : primary_fonts) {
+        FILE* f = fopen(fp, "rb");
+        if (f) { fclose(f); io.Fonts->AddFontFromFileTTF(fp, 18.0f, nullptr, ranges.Data); loaded = true; break; }
+    }
+    if (!loaded) { io.Fonts->AddFontDefault(); return; }
+
+    // Merge Thai font (tahoma supports Thai on Windows)
+    ImFontConfig mergeCfg; mergeCfg.MergeMode = true;
+    static ImVector<ImWchar> thaiRanges;
+    ImFontGlyphRangesBuilder thaiBuilder;
+    thaiBuilder.AddRanges(io.Fonts->GetGlyphRangesThai());
+    thaiBuilder.BuildRanges(&thaiRanges);
+    const char* thai_fonts[] = { "C:\\Windows\\Fonts\\tahoma.ttf", "C:\\Windows\\Fonts\\thonburi.ttc" };
+    for (const char* fp : thai_fonts) {
+        FILE* f = fopen(fp, "rb");
+        if (f) { fclose(f); io.Fonts->AddFontFromFileTTF(fp, 18.0f, &mergeCfg, thaiRanges.Data); break; }
+    }
+
+    // Merge Vietnamese font
+    static ImVector<ImWchar> vietRanges;
+    ImFontGlyphRangesBuilder vietBuilder;
+    vietBuilder.AddRanges(io.Fonts->GetGlyphRangesVietnamese());
+    vietBuilder.BuildRanges(&vietRanges);
+    const char* viet_fonts[] = { "C:\\Windows\\Fonts\\segoeui.ttf", "C:\\Windows\\Fonts\\tahoma.ttf" };
+    for (const char* fp : viet_fonts) {
+        FILE* f = fopen(fp, "rb");
+        if (f) { fclose(f); io.Fonts->AddFontFromFileTTF(fp, 18.0f, &mergeCfg, vietRanges.Data); break; }
+    }
 #else
+    const char* font_candidates[] = {
         "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
         "/System/Library/Fonts/PingFang.ttc",
         "/System/Library/Fonts/Supplemental/Thonburi.ttc",
-#endif
     };
-
     bool loaded = false;
     for (const char* font_path : font_candidates) {
         FILE* f = fopen(font_path, "rb");
-        if (f) {
-            fclose(f);
-            io.Fonts->AddFontFromFileTTF(font_path, 18.0f, NULL, ranges.Data);
-            loaded = true;
-            break;
-        }
+        if (f) { fclose(f); io.Fonts->AddFontFromFileTTF(font_path, 18.0f, NULL, ranges.Data); loaded = true; break; }
     }
-
-    if (!loaded) {
-        io.Fonts->AddFontDefault();
-    }
+    if (!loaded) io.Fonts->AddFontDefault();
+#endif
 }
+
 
 void ApplyCustomStyle() {
     ImGuiStyle& style = ImGui::GetStyle();
     ImVec4* colors = style.Colors;
-
     style.WindowRounding = 8.0f;
     style.FrameRounding = 4.0f;
     style.GrabRounding = 4.0f;
@@ -268,12 +351,10 @@ void ApplyCustomStyle() {
     style.TabRounding = 4.0f;
     style.PopupRounding = 4.0f;
     style.ChildRounding = 6.0f;
-
     style.WindowPadding = ImVec2(16, 16);
     style.FramePadding = ImVec2(8, 5);
     style.ItemSpacing = ImVec2(10, 6);
     style.ItemInnerSpacing = ImVec2(6, 4);
-
     colors[ImGuiCol_WindowBg]           = ImVec4(0.12f, 0.13f, 0.17f, 1.00f);
     colors[ImGuiCol_ChildBg]            = ImVec4(0.15f, 0.16f, 0.21f, 1.00f);
     colors[ImGuiCol_Border]             = ImVec4(0.25f, 0.27f, 0.33f, 0.50f);
@@ -316,7 +397,399 @@ void StatusIndicator(bool running) {
     ImGui::Dummy(ImVec2(r * 2 + 4, r * 2));
 }
 
-int main(int, char**) {
+// ===== Shared UI State =====
+static int s_port = LanProxy::DEFAULT_SERVER_PORT;
+static bool s_show_about = false;
+static char s_username_buf[128] = {};
+static char s_password_buf[128] = {};
+static int s_days = 30;
+static std::vector<std::pair<std::string, UserInfo>> s_users;
+static std::vector<LogEntry> s_logEntries;
+static bool s_autoScroll = true;
+
+// ===== Shared UI Render =====
+static void RenderImGuiUI(int display_w, int display_h) {
+    auto& loc = Localization::getInstance();
+
+    // ===== Menu Bar =====
+    if (ImGui::BeginMainMenuBar()) {
+        if (ImGui::BeginMenu(loc.get("LANGUAGE").c_str())) {
+            for (const auto& lang : loc.getAvailableLanguages()) {
+                if (ImGui::MenuItem(lang.name.c_str(), NULL, loc.getLanguage() == lang.code)) {
+                    loc.setLanguage(lang.code);
+                }
+            }
+            ImGui::EndMenu();
+        }
+        if (ImGui::MenuItem(loc.get("ABOUT").c_str())) {
+            s_show_about = true;
+        }
+        ImGui::EndMainMenuBar();
+    }
+
+    // ===== About Modal =====
+    if (s_show_about) {
+        ImGui::OpenPopup(loc.get("ABOUT").c_str());
+        s_show_about = false;
+    }
+    if (ImGui::BeginPopupModal(loc.get("ABOUT").c_str(), NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("HtkisPro v1.1");
+        ImGui::Separator();
+        ImGui::Text("%s: Hunt", loc.get("DEVELOPER").c_str());
+        ImGui::Text("%s: admin@cii.sh.cn", loc.get("EMAIL").c_str());
+        ImGui::Text("Build: D3D11 fallback + static CRT");
+        ImGui::Spacing();
+        if (ImGui::Button("OK", ImVec2(120, 0))) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    // ===== Main Window =====
+    {
+        ImGui::SetNextWindowPos(ImVec2(0, ImGui::GetFrameHeight()));
+        ImGui::SetNextWindowSize(ImVec2((float)display_w, (float)display_h - ImGui::GetFrameHeight()));
+        ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus |
+                                 ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
+        ImGui::Begin("##Main", NULL, flags);
+
+        auto& app = ServerApp::getInstance();
+
+        // ===== Left Panel =====
+        float panelWidth = 280.0f;
+        ImGui::BeginChild("##LeftPanel", ImVec2(panelWidth, 0), true);
+        ImGui::TextColored(ImVec4(0.6f, 0.7f, 0.85f, 1.0f), "%s", loc.get("SERVICE_STATUS").c_str());
+        ImGui::Spacing();
+        StatusIndicator(app.isRunning());
+        ImGui::SameLine();
+        if (app.isRunning()) {
+            ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.4f, 1.0f), "%s", loc.get("STATUS_RUNNING").c_str());
+        } else {
+            ImGui::TextColored(ImVec4(0.9f, 0.3f, 0.3f, 1.0f), "%s", loc.get("STATUS_STOPPED").c_str());
+        }
+        ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+        ImGui::TextColored(ImVec4(0.6f, 0.7f, 0.85f, 1.0f), "%s", loc.get("PROXY_CONFIG").c_str());
+        ImGui::Spacing();
+        if (!app.isRunning()) {
+            ImGui::SetNextItemWidth(-1);
+            ImGui::InputInt("##port", &s_port);
+            if (s_port < 1) s_port = 1;
+            if (s_port > 65535) s_port = 65535;
+        } else {
+            ImGui::Text("%s: %d", loc.get("SERVER_PORT").c_str(), app.getPort());
+        }
+        ImGui::Spacing();
+        if (app.isRunning()) {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.7f, 0.2f, 0.2f, 0.9f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.85f, 0.25f, 0.25f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.6f, 0.15f, 0.15f, 1.0f));
+            if (ImGui::Button(loc.get("STOP_SERVER").c_str(), ImVec2(-1, 36))) app.stop();
+            ImGui::PopStyleColor(3);
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.55f, 0.3f, 0.9f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.25f, 0.65f, 0.35f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.15f, 0.45f, 0.25f, 1.0f));
+            if (ImGui::Button(loc.get("START_SERVER").c_str(), ImVec2(-1, 36))) app.start(s_port);
+            ImGui::PopStyleColor(3);
+        }
+        ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+        ImGui::TextColored(ImVec4(0.6f, 0.7f, 0.85f, 1.0f), "%s", loc.get("PROTOCOL_INFO").c_str());
+        ImGui::Spacing();
+        ImGui::TextColored(ImVec4(0.55f, 0.6f, 0.7f, 1.0f), "HTTP CONNECT");
+        ImGui::TextColored(ImVec4(0.55f, 0.6f, 0.7f, 1.0f), "SOCKS5");
+        ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+        ImGui::TextWrapped("%s", loc.get("USAGE_HINT").c_str());
+        ImGui::EndChild();
+
+        // ===== Right Panel =====
+        ImGui::SameLine();
+        ImGui::BeginChild("##RightPanel", ImVec2(0, 0), false);
+        float rightHeight = ImGui::GetContentRegionAvail().y;
+        float userPanelHeight = rightHeight * 0.45f;
+        float logPanelHeight = rightHeight - userPanelHeight;
+
+        // ---- User Management ----
+        ImGui::BeginChild("##UserPanel", ImVec2(0, userPanelHeight), true);
+        ImGui::TextColored(ImVec4(0.6f, 0.7f, 0.85f, 1.0f), "%s", loc.get("USER_MANAGEMENT").c_str());
+        ImGui::Spacing();
+        float formWidth = ImGui::GetContentRegionAvail().x;
+        float fieldWidth = (formWidth - ImGui::GetStyle().ItemSpacing.x * 2) / 3.0f;
+        ImGui::SetNextItemWidth(fieldWidth);
+        ImGui::InputText(loc.get("USERNAME").c_str(), s_username_buf, IM_ARRAYSIZE(s_username_buf));
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(fieldWidth);
+        ImGui::InputText(loc.get("PASSWORD").c_str(), s_password_buf, IM_ARRAYSIZE(s_password_buf), ImGuiInputTextFlags_Password);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(fieldWidth);
+        ImGui::InputInt(loc.get("DAYS").c_str(), &s_days);
+        if (s_days < 1) s_days = 1;
+        ImGui::Spacing();
+        float btnWidth = 120.0f;
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.45f, 0.7f, 0.9f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.25f, 0.55f, 0.82f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.15f, 0.38f, 0.6f, 1.0f));
+        if (ImGui::Button(loc.get("ADD_USER").c_str(), ImVec2(btnWidth, 28))) {
+            if (strlen(s_username_buf) > 0 && strlen(s_password_buf) > 0) {
+                UserManager::getInstance().addUser(s_username_buf, s_password_buf, s_days);
+                UserManager::getInstance().save();
+                s_username_buf[0] = '\0';
+                s_password_buf[0] = '\0';
+                s_users = UserManager::getInstance().getAllUsers();
+            }
+        }
+        ImGui::PopStyleColor(3);
+        ImGui::SameLine();
+        if (ImGui::Button(loc.get("REFRESH_LIST").c_str(), ImVec2(btnWidth, 28))) {
+            s_users = UserManager::getInstance().getAllUsers();
+        }
+        ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+        if (ImGui::BeginTable("##Users", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable, ImVec2(0, ImGui::GetContentRegionAvail().y))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn(loc.get("USERNAME").c_str(), ImGuiTableColumnFlags_WidthStretch, 0.3f);
+            ImGui::TableSetupColumn(loc.get("ACTIVE").c_str(), ImGuiTableColumnFlags_WidthFixed, 70.0f);
+            ImGui::TableSetupColumn(loc.get("EXPIRE_TIME").c_str(), ImGuiTableColumnFlags_WidthStretch, 0.4f);
+            ImGui::TableSetupColumn(loc.get("ACTIONS").c_str(), ImGuiTableColumnFlags_WidthFixed, 140.0f);
+            ImGui::TableHeadersRow();
+            for (const auto& user : s_users) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::Text("%s", user.first.c_str());
+                ImGui::TableSetColumnIndex(1);
+                if (user.second.active) {
+                    ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.4f, 1.0f), "O");
+                    ImGui::SameLine();
+                    ImGui::Text("%s", loc.get("YES").c_str());
+                } else {
+                    ImGui::TextColored(ImVec4(0.9f, 0.3f, 0.3f, 1.0f), "X");
+                    ImGui::SameLine();
+                    ImGui::Text("%s", loc.get("NO").c_str());
+                }
+                ImGui::TableSetColumnIndex(2);
+                char timeBuf[64] = {};
+                struct tm tm_buf;
+#ifdef _WIN32
+                localtime_s(&tm_buf, &user.second.expire_time);
+#else
+                localtime_r(&user.second.expire_time, &tm_buf);
+#endif
+                strftime(timeBuf, sizeof(timeBuf), "%Y-%m-%d %H:%M", &tm_buf);
+                ImGui::Text("%s", timeBuf);
+                ImGui::TableSetColumnIndex(3);
+                std::string toggleLabel = std::string(user.second.active ? loc.get("DEACTIVATE") : loc.get("ACTIVATE")) + "##" + user.first;
+                if (ImGui::SmallButton(toggleLabel.c_str())) {
+                    UserManager::getInstance().setStatus(user.first, !user.second.active);
+                    UserManager::getInstance().save();
+                    s_users = UserManager::getInstance().getAllUsers();
+                    break;
+                }
+                ImGui::SameLine();
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.15f, 0.15f, 0.8f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.75f, 0.2f, 0.2f, 1.0f));
+                std::string delLabel = std::string(loc.get("DELETE").c_str()) + "##" + user.first;
+                if (ImGui::SmallButton(delLabel.c_str())) {
+                    UserManager::getInstance().removeUser(user.first);
+                    UserManager::getInstance().save();
+                    s_users = UserManager::getInstance().getAllUsers();
+                    break;
+                }
+                ImGui::PopStyleColor(2);
+            }
+            ImGui::EndTable();
+        }
+        ImGui::EndChild();
+
+        // ---- Log Panel ----
+        ImGui::BeginChild("##LogPanel", ImVec2(0, logPanelHeight), true);
+        ImGui::TextColored(ImVec4(0.6f, 0.7f, 0.85f, 1.0f), "%s", loc.get("LOG_PANEL").c_str());
+        ImGui::SameLine(ImGui::GetContentRegionAvail().x - 60);
+        if (ImGui::SmallButton(loc.get("CLEAR").c_str())) {
+            Logger::getInstance().clear();
+            s_logEntries.clear();
+        }
+        ImGui::SameLine();
+        ImGui::Checkbox(loc.get("AUTO_SCROLL").c_str(), &s_autoScroll);
+        ImGui::Separator();
+        if (Logger::getInstance().hasNewEntries()) {
+            s_logEntries = Logger::getInstance().getEntries();
+            Logger::getInstance().markRead();
+        }
+        ImGui::BeginChild("##LogScroll", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
+        for (const auto& entry : s_logEntries) {
+            char timeBuf[32] = {};
+            struct tm tm_buf;
+#ifdef _WIN32
+            localtime_s(&tm_buf, &entry.time);
+#else
+            localtime_r(&entry.time, &tm_buf);
+#endif
+            strftime(timeBuf, sizeof(timeBuf), "%H:%M:%S", &tm_buf);
+            ImVec4 color;
+            const char* prefix;
+            switch (entry.level) {
+            case LogLevel::Info:  color = ImVec4(0.6f, 0.8f, 1.0f, 1.0f); prefix = "INFO";  break;
+            case LogLevel::Warn:  color = ImVec4(1.0f, 0.8f, 0.2f, 1.0f); prefix = "WARN";  break;
+            case LogLevel::Error: color = ImVec4(1.0f, 0.4f, 0.4f, 1.0f); prefix = "ERR ";  break;
+            default:              color = ImVec4(0.7f, 0.7f, 0.7f, 1.0f); prefix = "????";  break;
+            }
+            ImGui::TextDisabled("%s", timeBuf);
+            ImGui::SameLine();
+            ImGui::TextColored(color, "[%s]", prefix);
+            ImGui::SameLine();
+            ImGui::Text("%s", entry.message.c_str());
+        }
+        if (s_autoScroll && ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) {
+            ImGui::SetScrollHereY(1.0f);
+        }
+        ImGui::EndChild();
+        ImGui::EndChild();
+        ImGui::EndChild(); // RightPanel
+        ImGui::End(); // Main
+    }
+}
+
+// ===== Common Init =====
+static void CommonInit() {
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO(); (void)io;
+    io.IniFilename = NULL;
+    ApplyCustomStyle();
+    LoadFonts();
+    UserManager::getInstance().load("users.txt");
+}
+
+static void CommonCleanup() {
+    ServerApp::getInstance().stop();
+    UserManager::getInstance().save();
+#ifdef _WIN32
+    CleanupTray();
+    Gdiplus::GdiplusShutdown(g_gdiplusToken);
+#endif
+    ImGui::DestroyContext();
+}
+
+#ifdef _WIN32
+// ===== D3D11 Path =====
+static int RunD3D11Path() {
+    g_useD3D11 = true;
+
+    Gdiplus::GdiplusStartupInput gdiplusStartupInput;
+    Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusStartupInput, NULL);
+
+    std::wstring exeDir = GetExeDir();
+    std::wstring pngPath = exeDir + L"\\HtkisPro.png";
+    DWORD attrs = GetFileAttributesW(pngPath.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) pngPath = L"HtkisPro.png";
+    g_hIcon = LoadIconFromPNG(pngPath, 32);
+
+    WNDCLASSEXW wc = {};
+    wc.cbSize = sizeof(WNDCLASSEXW);
+    wc.style = CS_CLASSDC;
+    wc.lpfnWndProc = D3D11WndProc;
+    wc.hInstance = GetModuleHandleW(NULL);
+    wc.lpszClassName = L"HtkisProD3D11";
+    wc.hIcon = g_hIcon ? g_hIcon : LoadIconW(NULL, (LPCWSTR)IDI_APPLICATION);
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    RegisterClassExW(&wc);
+
+    RECT rc = {0, 0, 960, 720};
+    AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
+    g_d3d11Hwnd = CreateWindowW(L"HtkisProD3D11", L"HtkisPro", WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top,
+        NULL, NULL, GetModuleHandleW(NULL), NULL);
+    if (!g_d3d11Hwnd) return 1;
+
+    ShowWindow(g_d3d11Hwnd, SW_SHOWDEFAULT);
+    UpdateWindow(g_d3d11Hwnd);
+
+    DXGI_SWAP_CHAIN_DESC sd = {};
+    sd.BufferCount = 2;
+    sd.BufferDesc.Width = 0;
+    sd.BufferDesc.Height = 0;
+    sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.BufferDesc.RefreshRate.Numerator = 60;
+    sd.BufferDesc.RefreshRate.Denominator = 1;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.OutputWindow = g_d3d11Hwnd;
+    sd.SampleDesc.Count = 1;
+    sd.SampleDesc.Quality = 0;
+    sd.Windowed = TRUE;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+
+    D3D_FEATURE_LEVEL fls[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_9_3, D3D_FEATURE_LEVEL_9_2, D3D_FEATURE_LEVEL_9_1 };
+    HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, fls, 6, D3D11_SDK_VERSION, &sd, &g_swapChain, &g_d3dDevice, nullptr, &g_d3dContext);
+    if (FAILED(hr)) {
+        hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, fls, 6, D3D11_SDK_VERSION, &sd, &g_swapChain, &g_d3dDevice, nullptr, &g_d3dContext);
+        if (FAILED(hr)) return 1;
+    }
+    CreateRenderTarget();
+
+    InitTray(g_hIcon ? g_hIcon : LoadIcon(NULL, IDI_APPLICATION));
+
+    CommonInit();
+    ImGui_ImplWin32_Init(g_d3d11Hwnd);
+    ImGui_ImplDX11_Init(g_d3dDevice, g_d3dContext);
+
+    // ===== Main Loop =====
+    while (!g_shouldExit) {
+        MSG msg;
+        while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+            if (msg.message == WM_QUIT) g_shouldExit = true;
+        }
+        ProcessTrayMessages();
+        if (g_shouldExit) break;
+
+        if (!g_d3d11WindowVisible) {
+            WaitMessage();
+            MSG msg2;
+            while (PeekMessage(&msg2, NULL, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg2);
+                DispatchMessage(&msg2);
+                if (msg2.message == WM_QUIT) g_shouldExit = true;
+            }
+            ProcessTrayMessages();
+            continue;
+        }
+
+        SetWindowTextW(g_d3d11Hwnd, L"HtkisPro");
+
+        ImGui_ImplDX11_NewFrame();
+        ImGui_ImplWin32_NewFrame();
+        ImGui::NewFrame();
+
+        RECT rect;
+        GetClientRect(g_d3d11Hwnd, &rect);
+        int display_w = rect.right - rect.left;
+        int display_h = rect.bottom - rect.top;
+        RenderImGuiUI(display_w, display_h);
+
+        ImGui::Render();
+        const float clear_color[4] = { 0.10f, 0.11f, 0.14f, 1.00f };
+        g_d3dContext->OMSetRenderTargets(1, &g_mainRenderTargetView, nullptr);
+        g_d3dContext->ClearRenderTargetView(g_mainRenderTargetView, clear_color);
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        g_swapChain->Present(1, 0);
+    }
+
+    // ===== Cleanup =====
+    ImGui_ImplDX11_Shutdown();
+    ImGui_ImplWin32_Shutdown();
+    CommonCleanup();
+    CleanupRenderTarget();
+    if (g_swapChain) { g_swapChain->Release(); g_swapChain = nullptr; }
+    if (g_d3dContext) { g_d3dContext->Release(); g_d3dContext = nullptr; }
+    if (g_d3dDevice) { g_d3dDevice->Release(); g_d3dDevice = nullptr; }
+    if (g_d3d11Hwnd) { DestroyWindow(g_d3d11Hwnd); g_d3d11Hwnd = nullptr; }
+    UnregisterClassW(L"HtkisProD3D11", GetModuleHandleW(NULL));
+    return 0;
+}
+#endif // _WIN32
+
+// ===== GLFW Path =====
+static int RunGLFWPath() {
     glfwSetErrorCallback(glfw_error_callback);
     if (!glfwInit()) return 1;
 
@@ -328,75 +801,37 @@ int main(int, char**) {
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 #endif
 
-    auto& loc = Localization::getInstance();
-
     GLFWwindow* window = glfwCreateWindow(960, 720, "HtkisPro", NULL, NULL);
     if (!window) return 1;
     g_window = window;
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
-
-    // Set close callback - hide to tray instead of closing
     glfwSetWindowCloseCallback(window, window_close_callback);
 
 #ifdef _WIN32
-    // Initialize GDI+
     Gdiplus::GdiplusStartupInput gdiplusStartupInput;
     Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusStartupInput, NULL);
-
-    // Load icon from PNG
     std::wstring exeDir = GetExeDir();
     std::wstring pngPath = exeDir + L"\\HtkisPro.png";
-
-    // Try exe directory first, then current directory
     DWORD attrs = GetFileAttributesW(pngPath.c_str());
-    if (attrs == INVALID_FILE_ATTRIBUTES) {
-        pngPath = L"HtkisPro.png";
-    }
-
-    // Set GLFW window icon (title bar + taskbar)
+    if (attrs == INVALID_FILE_ATTRIBUTES) pngPath = L"HtkisPro.png";
     SetGLFWWindowIcon(pngPath, window);
-
-    // Create tray icon (32x32)
     g_hIcon = LoadIconFromPNG(pngPath, 32);
     InitTray(g_hIcon ? g_hIcon : LoadIcon(NULL, IDI_APPLICATION));
 #endif
 
-    IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
-    ImGuiIO& io = ImGui::GetIO(); (void)io;
-    io.IniFilename = NULL;
-
-    ApplyCustomStyle();
-
+    CommonInit();
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init(glsl_version);
-
-    LoadFonts();
-
-    UserManager::getInstance().load("users.txt");
-
-    // State
-    static int port = LanProxy::DEFAULT_SERVER_PORT;
-    static bool show_about = false;
-    static char username_buf[128] = {};
-    static char password_buf[128] = {};
-    static int days = 30;
-    static std::vector<std::pair<std::string, UserInfo>> users;
-    static std::vector<LogEntry> logEntries;
-    static bool autoScroll = true;
 
     // ===== Main Loop =====
     while (!g_shouldExit) {
         glfwPollEvents();
-
 #ifdef _WIN32
         ProcessTrayMessages();
 #endif
-
         if (g_shouldExit) break;
 
-        // When window is hidden, sleep and skip rendering
         if (!glfwGetWindowAttrib(window, GLFW_VISIBLE)) {
 #ifdef _WIN32
             Sleep(50);
@@ -407,315 +842,15 @@ int main(int, char**) {
         }
 
         glfwSetWindowTitle(window, "HtkisPro");
-
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        // ===== Menu Bar =====
-        if (ImGui::BeginMainMenuBar()) {
-            if (ImGui::BeginMenu(loc.get("LANGUAGE").c_str())) {
-                for (const auto& lang : loc.getAvailableLanguages()) {
-                    if (ImGui::MenuItem(lang.name.c_str(), NULL, loc.getLanguage() == lang.code)) {
-                        loc.setLanguage(lang.code);
-                    }
-                }
-                ImGui::EndMenu();
-            }
-            if (ImGui::MenuItem(loc.get("ABOUT").c_str())) {
-                show_about = true;
-            }
-            ImGui::EndMainMenuBar();
-        }
-
-        // ===== About Modal =====
-        if (show_about) {
-            ImGui::OpenPopup(loc.get("ABOUT").c_str());
-            show_about = false;
-        }
-        if (ImGui::BeginPopupModal(loc.get("ABOUT").c_str(), NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::Text("HtkisPro");
-            ImGui::Separator();
-            ImGui::Text("%s: Hunt", loc.get("DEVELOPER").c_str());
-            ImGui::Text("%s: admin@cii.sh.cn", loc.get("EMAIL").c_str());
-            ImGui::Spacing();
-            if (ImGui::Button("OK", ImVec2(120, 0))) {
-                ImGui::CloseCurrentPopup();
-            }
-            ImGui::EndPopup();
-        }
-
-        // ===== Main Window =====
-        {
-            int display_w, display_h;
-            glfwGetFramebufferSize(window, &display_w, &display_h);
-            ImGui::SetNextWindowPos(ImVec2(0, ImGui::GetFrameHeight()));
-            ImGui::SetNextWindowSize(ImVec2((float)display_w, (float)display_h - ImGui::GetFrameHeight()));
-
-            ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-                                     ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus |
-                                     ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
-
-            ImGui::Begin("##Main", NULL, flags);
-
-            auto& app = ServerApp::getInstance();
-
-            // ===== Left Panel =====
-            float panelWidth = 280.0f;
-            ImGui::BeginChild("##LeftPanel", ImVec2(panelWidth, 0), true);
-
-            // Status
-            ImGui::TextColored(ImVec4(0.6f, 0.7f, 0.85f, 1.0f), "%s", loc.get("SERVICE_STATUS").c_str());
-            ImGui::Spacing();
-
-            StatusIndicator(app.isRunning());
-            ImGui::SameLine();
-            if (app.isRunning()) {
-                ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.4f, 1.0f), "%s", loc.get("STATUS_RUNNING").c_str());
-            } else {
-                ImGui::TextColored(ImVec4(0.9f, 0.3f, 0.3f, 1.0f), "%s", loc.get("STATUS_STOPPED").c_str());
-            }
-
-            ImGui::Spacing();
-            ImGui::Separator();
-            ImGui::Spacing();
-
-            // Port config
-            ImGui::TextColored(ImVec4(0.6f, 0.7f, 0.85f, 1.0f), "%s", loc.get("PROXY_CONFIG").c_str());
-            ImGui::Spacing();
-
-            if (!app.isRunning()) {
-                ImGui::SetNextItemWidth(-1);
-                ImGui::InputInt("##port", &port);
-                if (port < 1) port = 1;
-                if (port > 65535) port = 65535;
-            } else {
-                ImGui::Text("%s: %d", loc.get("SERVER_PORT").c_str(), app.getPort());
-            }
-
-            ImGui::Spacing();
-
-            // Start/Stop button
-            if (app.isRunning()) {
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.7f, 0.2f, 0.2f, 0.9f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.85f, 0.25f, 0.25f, 1.0f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.6f, 0.15f, 0.15f, 1.0f));
-                if (ImGui::Button(loc.get("STOP_SERVER").c_str(), ImVec2(-1, 36))) {
-                    app.stop();
-                }
-                ImGui::PopStyleColor(3);
-            } else {
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.55f, 0.3f, 0.9f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.25f, 0.65f, 0.35f, 1.0f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.15f, 0.45f, 0.25f, 1.0f));
-                if (ImGui::Button(loc.get("START_SERVER").c_str(), ImVec2(-1, 36))) {
-                    app.start(port);
-                }
-                ImGui::PopStyleColor(3);
-            }
-
-            ImGui::Spacing();
-            ImGui::Separator();
-            ImGui::Spacing();
-
-            // Protocol info
-            ImGui::TextColored(ImVec4(0.6f, 0.7f, 0.85f, 1.0f), "%s", loc.get("PROTOCOL_INFO").c_str());
-            ImGui::Spacing();
-            ImGui::TextColored(ImVec4(0.55f, 0.6f, 0.7f, 1.0f), "HTTP CONNECT");
-            ImGui::TextColored(ImVec4(0.55f, 0.6f, 0.7f, 1.0f), "SOCKS5");
-
-            ImGui::Spacing();
-            ImGui::Separator();
-            ImGui::Spacing();
-
-            // Usage hint
-            ImGui::TextWrapped("%s", loc.get("USAGE_HINT").c_str());
-
-            ImGui::EndChild();
-
-            // ===== Right Panel =====
-            ImGui::SameLine();
-            ImGui::BeginChild("##RightPanel", ImVec2(0, 0), false);
-
-            // ---- Top: User Management ----
-            float rightHeight = ImGui::GetContentRegionAvail().y;
-            float userPanelHeight = rightHeight * 0.45f;
-            float logPanelHeight = rightHeight - userPanelHeight;
-
-            ImGui::BeginChild("##UserPanel", ImVec2(0, userPanelHeight), true);
-
-            ImGui::TextColored(ImVec4(0.6f, 0.7f, 0.85f, 1.0f), "%s", loc.get("USER_MANAGEMENT").c_str());
-            ImGui::Spacing();
-
-            // Add user form
-            float formWidth = ImGui::GetContentRegionAvail().x;
-            float fieldWidth = (formWidth - ImGui::GetStyle().ItemSpacing.x * 2) / 3.0f;
-
-            ImGui::SetNextItemWidth(fieldWidth);
-            ImGui::InputText(loc.get("USERNAME").c_str(), username_buf, IM_ARRAYSIZE(username_buf));
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(fieldWidth);
-            ImGui::InputText(loc.get("PASSWORD").c_str(), password_buf, IM_ARRAYSIZE(password_buf), ImGuiInputTextFlags_Password);
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(fieldWidth);
-            ImGui::InputInt(loc.get("DAYS").c_str(), &days);
-            if (days < 1) days = 1;
-
-            ImGui::Spacing();
-
-            float btnWidth = 120.0f;
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.45f, 0.7f, 0.9f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.25f, 0.55f, 0.82f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.15f, 0.38f, 0.6f, 1.0f));
-            if (ImGui::Button(loc.get("ADD_USER").c_str(), ImVec2(btnWidth, 28))) {
-                if (strlen(username_buf) > 0 && strlen(password_buf) > 0) {
-                    UserManager::getInstance().addUser(username_buf, password_buf, days);
-                    UserManager::getInstance().save();
-                    username_buf[0] = '\0';
-                    password_buf[0] = '\0';
-                    users = UserManager::getInstance().getAllUsers();
-                }
-            }
-            ImGui::PopStyleColor(3);
-
-            ImGui::SameLine();
-            if (ImGui::Button(loc.get("REFRESH_LIST").c_str(), ImVec2(btnWidth, 28))) {
-                users = UserManager::getInstance().getAllUsers();
-            }
-
-            ImGui::Spacing();
-            ImGui::Separator();
-            ImGui::Spacing();
-
-            // Users Table
-            if (ImGui::BeginTable("##Users", 4,
-                ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-                ImGuiTableFlags_Resizable,
-                ImVec2(0, ImGui::GetContentRegionAvail().y))) {
-
-                ImGui::TableSetupScrollFreeze(0, 1);
-                ImGui::TableSetupColumn(loc.get("USERNAME").c_str(), ImGuiTableColumnFlags_WidthStretch, 0.3f);
-                ImGui::TableSetupColumn(loc.get("ACTIVE").c_str(), ImGuiTableColumnFlags_WidthFixed, 70.0f);
-                ImGui::TableSetupColumn(loc.get("EXPIRE_TIME").c_str(), ImGuiTableColumnFlags_WidthStretch, 0.4f);
-                ImGui::TableSetupColumn(loc.get("ACTIONS").c_str(), ImGuiTableColumnFlags_WidthFixed, 140.0f);
-                ImGui::TableHeadersRow();
-
-                for (const auto& user : users) {
-                    ImGui::TableNextRow();
-
-                    ImGui::TableSetColumnIndex(0);
-                    ImGui::Text("%s", user.first.c_str());
-
-                    ImGui::TableSetColumnIndex(1);
-                    if (user.second.active) {
-                        ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.4f, 1.0f), "O");
-                        ImGui::SameLine();
-                        ImGui::Text("%s", loc.get("YES").c_str());
-                    } else {
-                        ImGui::TextColored(ImVec4(0.9f, 0.3f, 0.3f, 1.0f), "X");
-                        ImGui::SameLine();
-                        ImGui::Text("%s", loc.get("NO").c_str());
-                    }
-
-                    ImGui::TableSetColumnIndex(2);
-                    char timeBuf[64] = {};
-                    struct tm tm_buf;
-#ifdef _WIN32
-                    localtime_s(&tm_buf, &user.second.expire_time);
-#else
-                    localtime_r(&user.second.expire_time, &tm_buf);
-#endif
-                    strftime(timeBuf, sizeof(timeBuf), "%Y-%m-%d %H:%M", &tm_buf);
-                    ImGui::Text("%s", timeBuf);
-
-                    ImGui::TableSetColumnIndex(3);
-                    std::string toggleLabel = std::string(user.second.active ? loc.get("DEACTIVATE") : loc.get("ACTIVATE")) + "##" + user.first;
-                    if (ImGui::SmallButton(toggleLabel.c_str())) {
-                        UserManager::getInstance().setStatus(user.first, !user.second.active);
-                        UserManager::getInstance().save();
-                        users = UserManager::getInstance().getAllUsers();
-                        break;
-                    }
-                    ImGui::SameLine();
-                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.15f, 0.15f, 0.8f));
-                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.75f, 0.2f, 0.2f, 1.0f));
-                    std::string delLabel = std::string(loc.get("DELETE").c_str()) + "##" + user.first;
-                    if (ImGui::SmallButton(delLabel.c_str())) {
-                        UserManager::getInstance().removeUser(user.first);
-                        UserManager::getInstance().save();
-                        users = UserManager::getInstance().getAllUsers();
-                        break;
-                    }
-                    ImGui::PopStyleColor(2);
-                }
-                ImGui::EndTable();
-            }
-
-            ImGui::EndChild();
-
-            // ---- Bottom: Log Panel ----
-            ImGui::BeginChild("##LogPanel", ImVec2(0, logPanelHeight), true);
-
-            ImGui::TextColored(ImVec4(0.6f, 0.7f, 0.85f, 1.0f), "%s", loc.get("LOG_PANEL").c_str());
-            ImGui::SameLine(ImGui::GetContentRegionAvail().x - 60);
-            if (ImGui::SmallButton(loc.get("CLEAR").c_str())) {
-                Logger::getInstance().clear();
-                logEntries.clear();
-            }
-            ImGui::SameLine();
-            ImGui::Checkbox(loc.get("AUTO_SCROLL").c_str(), &autoScroll);
-
-            ImGui::Separator();
-
-            // Fetch new logs
-            if (Logger::getInstance().hasNewEntries()) {
-                logEntries = Logger::getInstance().getEntries();
-                Logger::getInstance().markRead();
-            }
-
-            ImGui::BeginChild("##LogScroll", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
-
-            for (const auto& entry : logEntries) {
-                char timeBuf[32] = {};
-                struct tm tm_buf;
-#ifdef _WIN32
-                localtime_s(&tm_buf, &entry.time);
-#else
-                localtime_r(&entry.time, &tm_buf);
-#endif
-                strftime(timeBuf, sizeof(timeBuf), "%H:%M:%S", &tm_buf);
-
-                ImVec4 color;
-                const char* prefix;
-                switch (entry.level) {
-                case LogLevel::Info:  color = ImVec4(0.6f, 0.8f, 1.0f, 1.0f); prefix = "INFO";  break;
-                case LogLevel::Warn:  color = ImVec4(1.0f, 0.8f, 0.2f, 1.0f); prefix = "WARN";  break;
-                case LogLevel::Error: color = ImVec4(1.0f, 0.4f, 0.4f, 1.0f); prefix = "ERR ";  break;
-                default:              color = ImVec4(0.7f, 0.7f, 0.7f, 1.0f); prefix = "????";  break;
-                }
-
-                ImGui::TextDisabled("%s", timeBuf);
-                ImGui::SameLine();
-                ImGui::TextColored(color, "[%s]", prefix);
-                ImGui::SameLine();
-                ImGui::Text("%s", entry.message.c_str());
-            }
-
-            if (autoScroll && ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) {
-                ImGui::SetScrollHereY(1.0f);
-            }
-
-            ImGui::EndChild();
-            ImGui::EndChild();
-
-            ImGui::EndChild(); // RightPanel
-
-            ImGui::End(); // Main
-        }
-
-        ImGui::Render();
         int display_w, display_h;
         glfwGetFramebufferSize(window, &display_w, &display_h);
+        RenderImGuiUI(display_w, display_h);
+
+        ImGui::Render();
         glViewport(0, 0, display_w, display_h);
         glClearColor(0.10f, 0.11f, 0.14f, 1.00f);
         glClear(GL_COLOR_BUFFER_BIT);
@@ -724,20 +859,23 @@ int main(int, char**) {
     }
 
     // ===== Cleanup =====
-    ServerApp::getInstance().stop();
-    UserManager::getInstance().save();
-
-#ifdef _WIN32
-    CleanupTray();
-    Gdiplus::GdiplusShutdown(g_gdiplusToken);
-#endif
-
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
-    ImGui::DestroyContext();
-
+    CommonCleanup();
     glfwDestroyWindow(window);
     glfwTerminate();
-
     return 0;
+}
+
+int main(int, char**) {
+#ifdef _WIN32
+    // Try GLFW/OpenGL first
+    int result = RunGLFWPath();
+    if (result == 0 || g_shouldExit) return result;
+    // Fallback to D3D11
+    g_shouldExit = false;
+    return RunD3D11Path();
+#else
+    return RunGLFWPath();
+#endif
 }

@@ -105,7 +105,7 @@ private:
     ~ServerApp() { stop(); }
 
     std::atomic<bool> m_running{false};
-    int m_port{10800};
+    int m_port{65510};
 
     std::unique_ptr<asio::io_context> m_io_context;
     std::optional<asio::executor_work_guard<asio::io_context::executor_type>> m_work_guard;
