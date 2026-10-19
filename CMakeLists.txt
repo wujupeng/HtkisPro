@@ -60,7 +60,26 @@ add_executable(proxy_server
     src/server/Server.cpp
     src/server/GuiMain.cpp
     src/server/UserManager.cpp
+    src/server/IpAcl.cpp
+    src/server/Authenticator.cpp
+    src/server/AuthFailureTracker.cpp
+    src/server/DeadlineTimer.cpp
+    src/server/DnsCache.cpp
+    src/server/ReconnectPolicy.cpp
+    src/server/ConnectionPool.cpp
+    src/server/ProtocolDetector.cpp
+    src/server/UdpRelaySession.cpp
+    src/server/WebSocketFrame.cpp
+    src/server/WebSocketHandler.cpp
+    src/server/TokenBucket.cpp
+    src/server/RateLimiter.cpp
+    src/server/QosScheduler.cpp
+    src/server/StatsCollector.cpp
     src/common/Localization.cpp
+    src/common/Config.cpp
+    src/common/ConfigManager.cpp
+    src/common/CrashHandler.cpp
+    src/common/HashUtil.cpp
     ${IMGUI_SOURCES}
 )
 
@@ -75,6 +94,7 @@ endif()
 target_include_directories(proxy_server PRIVATE
     src/server
     src/common
+    third_party
     ${imgui_SOURCE_DIR}
     ${imgui_SOURCE_DIR}/backends
     ${asio_SOURCE_DIR}/include
@@ -90,4 +110,18 @@ if(OpenGL_FOUND)
 endif()
 if(WIN32)
     target_link_libraries(proxy_server PRIVATE gdiplus d3d11 dxgi d3dcompiler)
+endif()
+# ─── Testing ───
+option(BUILD_TESTING "Build unit tests" OFF)
+if(BUILD_TESTING)
+    FetchContent_Declare(
+        googletest
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG v1.14.0
+    )
+    set(gtest_force_shared_crt OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
+
+    enable_testing()
+    add_subdirectory(tests)
 endif()

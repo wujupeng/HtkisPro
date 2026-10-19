@@ -24,6 +24,7 @@ private:
     bool is_http_connect(const uint8_t* data, std::size_t length);
     void handle_http_connect(std::size_t length);
     void handle_socks5_handshake(std::size_t length);
+    void handle_socks4_handshake(std::size_t length);
 
     // SOCKS5 flow
     void do_auth();
@@ -53,8 +54,8 @@ private:
     asio::ip::tcp::socket m_remote_socket;
     asio::ip::tcp::resolver m_resolver;
 
-    std::array<uint8_t, 8192> m_client_buffer;
-    std::array<uint8_t, 8192> m_remote_buffer;
+    std::array<uint8_t, 65536> m_client_buffer;
+    std::array<uint8_t, 65536> m_remote_buffer;
 
     // Target info (used by both HTTP and SOCKS5)
     bool m_is_http{false};
@@ -76,13 +77,19 @@ private:
 
 class Server {
 public:
-    Server(asio::io_context& io_context, short port);
+    Server(asio::io_context& io_context, short port, asio::io_context& work_io);
     void stop();
+
+    static std::atomic<uint64_t>& activeSessionCount() {
+        static std::atomic<uint64_t> count{0};
+        return count;
+    }
 
 private:
     void do_accept();
 
     asio::ip::tcp::acceptor m_acceptor;
+    asio::io_context& m_work_io;
     bool m_running{true};
 };
 
@@ -99,6 +106,7 @@ public:
 
     bool isRunning() const { return m_running; }
     int getPort() const { return m_port; }
+    uint64_t activeSessionCount() const { return Server::activeSessionCount().load(); }
 
 private:
     ServerApp() = default;
@@ -107,8 +115,11 @@ private:
     std::atomic<bool> m_running{false};
     int m_port{65510};
 
-    std::unique_ptr<asio::io_context> m_io_context;
+    std::unique_ptr<asio::io_context> m_accept_io;
+    std::unique_ptr<asio::io_context> m_work_io;
+    std::optional<asio::executor_work_guard<asio::io_context::executor_type>> m_accept_guard;
     std::optional<asio::executor_work_guard<asio::io_context::executor_type>> m_work_guard;
     std::unique_ptr<Server> m_server;
-    std::thread m_thread;
+    std::vector<std::thread> m_threads;
+    int m_thread_count{0};
 };

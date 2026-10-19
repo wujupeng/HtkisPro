@@ -1,41 +1,77 @@
-# Build script for Htkis-LANProxySerCli
+﻿# Build script for HtkisPro
 $ErrorActionPreference = "Stop"
 
-$ProjectRoot = Get-Location
-$EnvDir = "$ProjectRoot\env"
-$CmakeBin = "$EnvDir\cmake\bin"
-$MinGwBin = "$EnvDir\mingw64\bin"
-
-# Add tools to PATH for this session
-$Env:PATH = "$CmakeBin;$MinGwBin;" + $Env:PATH
-
-Write-Host "Checking tools..."
-try {
-    $CmakeVer = cmake --version
-    Write-Host "CMake found: $CmakeVer"
-} catch {
-    Write-Error "CMake not found in $CmakeBin"
-}
-
-try {
-    $GppVer = g++ --version
-    Write-Host "G++ found: $GppVer"
-} catch {
-    Write-Error "G++ not found in $MinGwBin"
-}
-
-# Create build directory
+$ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $BuildDir = "$ProjectRoot\build"
-if (-not (Test-Path $BuildDir)) {
-    New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
+
+Write-Host "=== HtkisPro Build Script ===" -ForegroundColor Cyan
+Write-Host "Project: $ProjectRoot"
+Write-Host ""
+
+# Check cmake
+try {
+    $CmakeVer = (cmake --version) -split "`n" | Select-Object -First 1
+    Write-Host "[OK] $CmakeVer" -ForegroundColor Green
+} catch {
+    Write-Error "CMake not found. Install CMake 3.14+ and add to PATH."
+    exit 1
 }
 
-Set-Location $BuildDir
+# Check git (for FetchContent)
+try {
+    $GitVer = git --version
+    Write-Host "[OK] $GitVer" -ForegroundColor Green
+} catch {
+    Write-Error "Git not found. Install Git and add to PATH."
+    exit 1
+}
 
-Write-Host "Configuring project..."
-cmake -G "MinGW Makefiles" ..
+# Parse args
+$BuildTesting = $args -contains "-t" -or $args -contains "--tests"
+$CleanBuild = $args -contains "-c" -or $args -contains "--clean"
 
-Write-Host "Building project..."
-cmake --build .
+if ($CleanBuild -and (Test-Path $BuildDir)) {
+    Write-Host "Cleaning build directory..." -ForegroundColor Yellow
+    Remove-Item -Recurse -Force $BuildDir
+}
 
-Write-Host "Build success!"
+# Configure
+Write-Host ""
+Write-Host "Configuring..." -ForegroundColor Cyan
+$CmakeArgs = @("-B", $BuildDir, "-S", $ProjectRoot, "-G", "Visual Studio 17 2022", "-A", "x64")
+if ($BuildTesting) {
+    $CmakeArgs += @("-DBUILD_TESTING=ON")
+    Write-Host "  Testing enabled" -ForegroundColor Yellow
+}
+cmake @CmakeArgs
+if ($LASTEXITCODE -ne 0) { Write-Error "CMake configuration failed."; exit 1 }
+
+# Build
+Write-Host ""
+Write-Host "Building..." -ForegroundColor Cyan
+cmake --build $BuildDir --config Release
+if ($LASTEXITCODE -ne 0) { Write-Error "Build failed."; exit 1 }
+
+$ExePath = "$BuildDir\Release\proxy_server.exe"
+if (Test-Path $ExePath) {
+    $Size = (Get-Item $ExePath).Length / 1MB
+    Write-Host ""
+    Write-Host "Build success! Output: $ExePath ($([math]::Round($Size, 2)) MB)" -ForegroundColor Green
+} else {
+    Write-Host "Build completed but exe not found." -ForegroundColor Yellow
+}
+
+# Run tests if enabled
+if ($BuildTesting) {
+    $TestExe = "$BuildDir\tests\Release\proxy_tests.exe"
+    if (Test-Path $TestExe) {
+        Write-Host ""
+        Write-Host "Running tests..." -ForegroundColor Cyan
+        & $TestExe --gtest_color=yes
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "All tests passed!" -ForegroundColor Green
+        } else {
+            Write-Host "Some tests failed!" -ForegroundColor Red
+        }
+    }
+}

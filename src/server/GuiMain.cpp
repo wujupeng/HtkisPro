@@ -30,9 +30,17 @@
 #include "Protocol.h"
 #include "Localization.h"
 #include "Logger.h"
+#include "ConfigManager.h"
+#include "StatsCollector.h"
+#include "AuthFailureTracker.h"
+#include "DnsCache.h"
+#ifdef _WIN32
+#include "CrashHandler.h"
+#endif
 #include <iostream>
 #include <vector>
 #include <ctime>
+#include <algorithm>
 
 // ===== Global State =====
 static GLFWwindow* g_window = nullptr;
@@ -407,6 +415,202 @@ static std::vector<std::pair<std::string, UserInfo>> s_users;
 static std::vector<LogEntry> s_logEntries;
 static bool s_autoScroll = true;
 
+// ===== Config Panel =====
+static void RenderConfigPanel() {
+    auto cfg = Config::ConfigManager::getInstance().getSnapshot();
+
+    if (ImGui::BeginTabBar("##ConfigTabs")) {
+        // IP ACL
+        if (ImGui::BeginTabItem("IP ACL")) {
+            ImGui::Spacing();
+            const char* modes[] = {"Disabled", "Whitelist", "Blacklist"};
+            int modeIdx = static_cast<int>(cfg->ipAcl.mode);
+            if (ImGui::Combo("Mode", &modeIdx, modes, 3)) {
+                Config::ConfigManager::getInstance().updateIpAcl(
+                    [modeIdx](Config::IpAclConfig& c) { c.mode = static_cast<Config::AclMode>(modeIdx); });
+            }
+            ImGui::Spacing();
+            ImGui::Text("Rules (%d):", (int)cfg->ipAcl.rules.size());
+            static char cidrBuf[64] = {};
+            ImGui::InputText("##CidrInput", cidrBuf, sizeof(cidrBuf));
+            ImGui::SameLine();
+            if (ImGui::Button("Add")) {
+                if (strlen(cidrBuf) > 0) {
+                    Config::ConfigManager::getInstance().updateIpAcl(
+                        [&](Config::IpAclConfig& c) {
+                            Config::CidrRule rule;
+                            rule.network = cidrBuf;
+                            rule.isIpv6 = strchr(cidrBuf, ':') != nullptr;
+                            c.rules.push_back(rule);
+                        });
+                    cidrBuf[0] = '\0';
+                }
+            }
+            ImGui::Separator();
+            for (size_t i = 0; i < cfg->ipAcl.rules.size(); i++) {
+                ImGui::Text("%s", cfg->ipAcl.rules[i].network.c_str());
+                ImGui::SameLine(ImGui::GetContentRegionAvail().x - 50);
+                std::string label = "Del##" + std::to_string(i);
+                if (ImGui::SmallButton(label.c_str())) {
+                    Config::ConfigManager::getInstance().updateIpAcl(
+                        [i](Config::IpAclConfig& c) { c.rules.erase(c.rules.begin() + i); });
+                }
+            }
+            ImGui::EndTabItem();
+        }
+
+        // Rate Limit
+        if (ImGui::BeginTabItem("Rate Limit")) {
+            ImGui::Spacing();
+            static uint64_t globalUp = 0, globalDown = 0;
+            if (globalUp == 0) { globalUp = cfg->rateLimit.globalUpLimit; globalDown = cfg->rateLimit.globalDownLimit; }
+            ImGui::Text("Global Upload Limit (bytes/s, 0=unlimited):");
+            ImGui::InputScalar("##GlobalUp", ImGuiDataType_U64, &globalUp);
+            ImGui::Text("Global Download Limit (bytes/s, 0=unlimited):");
+            ImGui::InputScalar("##GlobalDown", ImGuiDataType_U64, &globalDown);
+            if (ImGui::Button("Apply")) {
+                Config::ConfigManager::getInstance().updateRateLimit(
+                    [&](Config::RateLimitConfig& c) {
+                        c.globalUpLimit = globalUp;
+                        c.globalDownLimit = globalDown;
+                    });
+            }
+            ImGui::EndTabItem();
+        }
+
+        // Connection Pool / DNS
+        if (ImGui::BeginTabItem("Pool/DNS")) {
+            ImGui::Spacing();
+            ImGui::Text("Connection Pool");
+            ImGui::Separator();
+            static bool poolEnabled = false;
+            static int maxConn = 256, idleTtl = 60;
+            if (!poolEnabled) { poolEnabled = cfg->connectionPool.enabled; maxConn = cfg->connectionPool.maxConnections; idleTtl = cfg->connectionPool.idleTtlSeconds; }
+            ImGui::Checkbox("Enabled", &poolEnabled);
+            ImGui::InputInt("Max Connections", &maxConn);
+            ImGui::InputInt("Idle TTL (s)", &idleTtl);
+            if (ImGui::Button("Apply Pool")) {
+                Config::ConfigManager::getInstance().updateConnectionPool(
+                    [&](Config::ConnectionPoolConfig& c) {
+                        c.enabled = poolEnabled;
+                        c.maxConnections = static_cast<uint32_t>((std::max)(1, maxConn));
+                        c.idleTtlSeconds = static_cast<uint32_t>((std::max)(1, idleTtl));
+                    });
+            }
+            ImGui::Spacing();
+            ImGui::Text("DNS Cache");
+            ImGui::Separator();
+            static bool dnsEnabled = false;
+            static int dnsTtl = 300, dnsMax = 4096;
+            if (!dnsEnabled) { dnsEnabled = cfg->dnsCache.enabled; dnsTtl = cfg->dnsCache.fixedTtlSeconds; dnsMax = cfg->dnsCache.maxEntries; }
+            ImGui::Checkbox("Enabled##DNS", &dnsEnabled);
+            ImGui::InputInt("TTL (s)##DNS", &dnsTtl);
+            ImGui::InputInt("Max Entries##DNS", &dnsMax);
+            if (ImGui::Button("Apply DNS")) {
+                Config::ConfigManager::getInstance().updateDnsCache(
+                    [&](Config::DnsCacheConfig& c) {
+                        c.enabled = dnsEnabled;
+                        c.fixedTtlSeconds = static_cast<uint32_t>((std::max)(1, dnsTtl));
+                        c.maxEntries = static_cast<uint32_t>((std::max)(1, dnsMax));
+                    });
+            }
+            ImGui::EndTabItem();
+        }
+
+        // Timeout
+        if (ImGui::BeginTabItem("Timeout")) {
+            ImGui::Spacing();
+            static int firstPkt = 10, connectT = 10, idleT = 300, retryCnt = 3;
+            static int initBackoff = 200, maxBackoff = 2000;
+            if (firstPkt == 10) {
+                firstPkt = cfg->timeout.firstPacketSeconds;
+                connectT = cfg->timeout.connectSeconds;
+                idleT = cfg->timeout.idleSeconds;
+                retryCnt = cfg->timeout.retryCount;
+                initBackoff = cfg->timeout.retryInitialBackoffMs;
+                maxBackoff = cfg->timeout.retryMaxBackoffMs;
+            }
+            ImGui::InputInt("First Packet (s)", &firstPkt);
+            ImGui::InputInt("Connect (s)", &connectT);
+            ImGui::InputInt("Idle (s)", &idleT);
+            ImGui::InputInt("Retry Count", &retryCnt);
+            ImGui::InputInt("Initial Backoff (ms)", &initBackoff);
+            ImGui::InputInt("Max Backoff (ms)", &maxBackoff);
+            if (ImGui::Button("Apply")) {
+                Config::ConfigManager::getInstance().updateTimeout(
+                    [&](Config::TimeoutConfig& c) {
+                        c.firstPacketSeconds = static_cast<uint32_t>((std::max)(1, firstPkt));
+                        c.connectSeconds = static_cast<uint32_t>((std::max)(1, connectT));
+                        c.idleSeconds = static_cast<uint32_t>((std::max)(1, idleT));
+                        c.retryCount = static_cast<uint32_t>((std::max)(0, retryCnt));
+                        c.retryInitialBackoffMs = static_cast<uint32_t>((std::max)(1, initBackoff));
+                        c.retryMaxBackoffMs = static_cast<uint32_t>((std::max)(1, maxBackoff));
+                    });
+            }
+            ImGui::EndTabItem();
+        }
+
+        ImGui::EndTabBar();
+    }
+}
+
+// ===== Stats Panel =====
+static void RenderStatsPanel() {
+    auto snap = StatsCollector::getInstance().getSnapshot();
+
+    ImGui::Spacing();
+    ImGui::TextColored(ImVec4(0.6f, 0.7f, 0.85f, 1.0f), "Global Statistics");
+    ImGui::Separator();
+    ImGui::Text("Active Sessions: %u", snap.activeSessionCount);
+    ImGui::Text("Total Upload: %llu bytes", (unsigned long long)snap.globalBytesUp);
+    ImGui::Text("Total Download: %llu bytes", (unsigned long long)snap.globalBytesDown);
+    ImGui::Text("Upload Rate: %llu bytes/s", (unsigned long long)snap.globalRateUp);
+    ImGui::Text("Download Rate: %llu bytes/s", (unsigned long long)snap.globalRateDown);
+
+    ImGui::Spacing();
+    ImGui::TextColored(ImVec4(0.6f, 0.7f, 0.85f, 1.0f), "Active Sessions");
+    ImGui::Separator();
+    if (ImGui::BeginTable("##Sessions", 5, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY)) {
+        ImGui::TableSetupColumn("User");
+        ImGui::TableSetupColumn("Protocol");
+        ImGui::TableSetupColumn("Target");
+        ImGui::TableSetupColumn("Up");
+        ImGui::TableSetupColumn("Down");
+        ImGui::TableHeadersRow();
+        for (const auto& s : snap.activeSessions) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0); ImGui::Text("%s", s.username.c_str());
+            ImGui::TableSetColumnIndex(1); ImGui::Text("%s", s.protocol.c_str());
+            ImGui::TableSetColumnIndex(2); ImGui::Text("%s", s.target.c_str());
+            ImGui::TableSetColumnIndex(3); ImGui::Text("%llu", (unsigned long long)s.bytesUp);
+            ImGui::TableSetColumnIndex(4); ImGui::Text("%llu", (unsigned long long)s.bytesDown);
+        }
+        ImGui::EndTable();
+    }
+
+    ImGui::Spacing();
+    ImGui::TextColored(ImVec4(0.6f, 0.7f, 0.85f, 1.0f), "Banned IPs");
+    ImGui::Separator();
+    auto blocked = AuthFailureTracker::getInstance().getBlocked();
+    if (blocked.empty()) {
+        ImGui::TextDisabled("No banned IPs");
+    } else {
+        for (const auto& [ip, remaining] : blocked) {
+            ImGui::Text("%s (remaining: %ds)", ip.c_str(), remaining);
+        }
+    }
+
+    ImGui::Spacing();
+    ImGui::TextColored(ImVec4(0.6f, 0.7f, 0.85f, 1.0f), "DNS Cache");
+    ImGui::Separator();
+    ImGui::Text("Cache Size: %zu", DnsCache::getInstance().size());
+    ImGui::Text("Cache Hits: %llu", (unsigned long long)DnsCache::getInstance().getHits());
+    ImGui::Text("Cache Misses: %llu", (unsigned long long)DnsCache::getInstance().getMisses());
+    if (ImGui::Button("Clear DNS Cache")) {
+        DnsCache::getInstance().clear();
+    }
+}
+
 // ===== Shared UI Render =====
 static void RenderImGuiUI(int display_w, int display_h) {
     auto& loc = Localization::getInstance();
@@ -505,6 +709,9 @@ static void RenderImGuiUI(int display_w, int display_h) {
         // ===== Right Panel =====
         ImGui::SameLine();
         ImGui::BeginChild("##RightPanel", ImVec2(0, 0), false);
+
+        if (ImGui::BeginTabBar("##RightTabs", ImGuiTabBarFlags_FittingPolicyResizeDown)) {
+            if (ImGui::BeginTabItem("Users")) {
         float rightHeight = ImGui::GetContentRegionAvail().y;
         float userPanelHeight = rightHeight * 0.45f;
         float logPanelHeight = rightHeight - userPanelHeight;
@@ -599,8 +806,12 @@ static void RenderImGuiUI(int display_w, int display_h) {
         }
         ImGui::EndChild();
 
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Log")) {
+
         // ---- Log Panel ----
-        ImGui::BeginChild("##LogPanel", ImVec2(0, logPanelHeight), true);
+        ImGui::BeginChild("##LogPanel", ImVec2(0, 0), true);
         ImGui::TextColored(ImVec4(0.6f, 0.7f, 0.85f, 1.0f), "%s", loc.get("LOG_PANEL").c_str());
         ImGui::SameLine(ImGui::GetContentRegionAvail().x - 60);
         if (ImGui::SmallButton(loc.get("CLEAR").c_str())) {
@@ -643,6 +854,19 @@ static void RenderImGuiUI(int display_w, int display_h) {
         }
         ImGui::EndChild();
         ImGui::EndChild();
+
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Config")) {
+                RenderConfigPanel();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Stats")) {
+                RenderStatsPanel();
+                ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
+        }
         ImGui::EndChild(); // RightPanel
         ImGui::End(); // Main
     }
@@ -656,7 +880,7 @@ static void CommonInit() {
     io.IniFilename = NULL;
     ApplyCustomStyle();
     LoadFonts();
-    UserManager::getInstance().load("users.txt");
+    UserManager::getInstance().load("users.json");
 }
 
 static void CommonCleanup() {
@@ -870,6 +1094,8 @@ static int RunGLFWPath() {
 
 int main(int, char**) {
 #ifdef _WIN32
+    CrashHandler::getInstance().init();
+    Config::ConfigManager::getInstance().loadFromFile("config.json");
     // Try GLFW/OpenGL first
     int result = RunGLFWPath();
     if (result == 0 || g_shouldExit) return result;

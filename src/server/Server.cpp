@@ -2,9 +2,13 @@
 #include "Protocol.h"
 #include "UserManager.h"
 #include "Logger.h"
+#include "IpAcl.h"
+#include "ConfigManager.h"
+#include "ProtocolDetector.h"
 #include <iostream>
 #include <cstring>
 #include <string_view>
+#include <chrono>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -55,6 +59,17 @@ void Session::start() {
     auto ep = m_client_socket.remote_endpoint();
     m_client_addr = ep.address().to_string() + ":" + std::to_string(ep.port());
     m_start_time = std::time(nullptr);
+    Server::activeSessionCount().fetch_add(1);
+
+    auto cfg = Config::ConfigManager::getInstance().getSnapshot();
+    IpAcl::getInstance().refreshConfig(
+        std::make_shared<Config::IpAclConfig>(cfg->ipAcl));
+    if (!IpAcl::getInstance().check(ep.address().to_string())) {
+        Logger::getInstance().info("[ACL] Rejected connection from " + ep.address().to_string());
+        close_session("acl rejected");
+        return;
+    }
+
     Logger::getInstance().info("[CONN] New connection from " + m_client_addr);
     do_handshake();
 }
@@ -76,6 +91,7 @@ void Session::close_session(const std::string& reason) {
         Logger::getInstance().info("[CLOSE] " + m_client_addr + " reason=" + reason);
     }
     m_tunnel_active = false;
+    Server::activeSessionCount().fetch_sub(1);
 }
 
 void Session::do_handshake() {
@@ -83,11 +99,38 @@ void Session::do_handshake() {
     m_client_socket.async_read_some(asio::buffer(m_client_buffer),
         [this, self](std::error_code ec, std::size_t length) {
             if (!ec) {
-                if (is_http_connect(m_client_buffer.data(), length)) {
-                    m_is_http = true;
-                    handle_http_connect(length);
-                } else {
-                    handle_socks5_handshake(length);
+                ProtocolDetector detector;
+                detector.feed(m_client_buffer.data(), length);
+                auto type = detector.detect();
+
+                switch (type) {
+                    case ProtocolType::HTTP_CONNECT:
+                        m_is_http = true;
+                        handle_http_connect(length);
+                        break;
+                    case ProtocolType::SOCKS5_TCP:
+                        handle_socks5_handshake(length);
+                        break;
+                    case ProtocolType::SOCKS4:
+                    case ProtocolType::SOCKS4A:
+                        handle_socks4_handshake(length);
+                        break;
+                    case ProtocolType::HTTPS:
+                        Logger::getInstance().warn("[HANDSHAKE] TLS not yet supported from " + m_client_addr);
+                        close_session("tls not supported");
+                        break;
+                    case ProtocolType::WEBSOCKET:
+                        Logger::getInstance().warn("[HANDSHAKE] WebSocket not yet supported from " + m_client_addr);
+                        close_session("websocket not supported");
+                        break;
+                    default:
+                        if (detector.needsMoreData()) {
+                            do_handshake();
+                        } else {
+                            Logger::getInstance().warn("[HANDSHAKE] Unknown protocol from " + m_client_addr);
+                            close_session("unknown protocol");
+                        }
+                        break;
                 }
             } else {
                 Logger::getInstance().warn("[HANDSHAKE] Read error from " + m_client_addr + ": " + AnsiToUtf8(ec.message()));
@@ -98,6 +141,88 @@ void Session::do_handshake() {
 
 bool Session::is_http_connect(const uint8_t* data, std::size_t length) {
     return length >= 8 && std::memcmp(data, "CONNECT ", 8) == 0;
+}
+
+// ============ SOCKS4/4a Flow ============
+
+void Session::handle_socks4_handshake(std::size_t length) {
+    if (length < 8) {
+        auto self(shared_from_this());
+        m_client_socket.async_read_some(asio::buffer(m_client_buffer),
+            [this, self](std::error_code ec, std::size_t len) {
+                if (!ec) handle_socks4_handshake(len);
+                else close_session("socks4 read error");
+            });
+        return;
+    }
+
+    uint8_t cd = m_client_buffer[1];
+    uint16_t dstPort = (static_cast<uint16_t>(m_client_buffer[2]) << 8) | m_client_buffer[3];
+    uint8_t dstIp[4] = {m_client_buffer[4], m_client_buffer[5], m_client_buffer[6], m_client_buffer[7]};
+
+    if (cd != 0x01) {
+        Logger::getInstance().warn("[SOCKS4] Unsupported command " + std::to_string(cd) + " from " + m_client_addr);
+        auto reply = std::make_shared<std::vector<uint8_t>>(std::initializer_list<uint8_t>{0x00, 0x5B, 0, 0, 0, 0, 0, 0});
+        asio::async_write(m_client_socket, asio::buffer(*reply),
+            [this, self = shared_from_this(), reply](std::error_code, std::size_t) {
+                close_session("socks4 unsupported command");
+            });
+        return;
+    }
+
+    size_t useridStart = 8;
+    size_t useridEnd = useridStart;
+    while (useridEnd < length && m_client_buffer[useridEnd] != 0) useridEnd++;
+    if (useridEnd >= length) {
+        auto self(shared_from_this());
+        m_client_socket.async_read_some(asio::buffer(m_client_buffer),
+            [this, self](std::error_code ec, std::size_t len) {
+                if (!ec) handle_socks4_handshake(len);
+                else close_session("socks4 userid read error");
+            });
+        return;
+    }
+
+    std::string userid(reinterpret_cast<char*>(&m_client_buffer[useridStart]), useridEnd - useridStart);
+
+    bool isSocks4a = (dstIp[0] == 0 && dstIp[1] == 0 && dstIp[2] == 0 && dstIp[3] != 0);
+
+    if (isSocks4a) {
+        size_t domainStart = useridEnd + 1;
+        size_t domainEnd = domainStart;
+        while (domainEnd < length && m_client_buffer[domainEnd] != 0) domainEnd++;
+        if (domainEnd >= length) {
+            auto self(shared_from_this());
+            m_client_socket.async_read_some(asio::buffer(m_client_buffer),
+                [this, self](std::error_code ec, std::size_t len) {
+                    if (!ec) handle_socks4_handshake(len);
+                    else close_session("socks4a domain read error");
+                });
+            return;
+        }
+        m_target_host = std::string(reinterpret_cast<char*>(&m_client_buffer[domainStart]), domainEnd - domainStart);
+    } else {
+        char ipBuf[16];
+        snprintf(ipBuf, sizeof(ipBuf), "%u.%u.%u.%u", dstIp[0], dstIp[1], dstIp[2], dstIp[3]);
+        m_target_host = ipBuf;
+    }
+
+    m_target_port = dstPort;
+    m_username = userid;
+    m_is_http = false;
+
+    Logger::getInstance().info("[SOCKS4] CONNECT " + m_target_host + ":" + std::to_string(m_target_port) +
+        " user=" + m_username + " from=" + m_client_addr);
+
+    auto reply = std::make_shared<std::vector<uint8_t>>(std::initializer_list<uint8_t>{0x00, 0x5A, 0, 0, 0, 0, 0, 0});
+    asio::async_write(m_client_socket, asio::buffer(*reply),
+        [this, self = shared_from_this(), reply](std::error_code ec, std::size_t) {
+            if (!ec) {
+                do_resolve(m_target_host, m_target_port);
+            } else {
+                close_session("socks4 reply write error");
+            }
+        });
 }
 
 // ============ HTTP CONNECT Flow ============
@@ -580,8 +705,9 @@ void Session::do_write_client(std::size_t length) {
 
 // ============ Server Acceptor ============
 
-Server::Server(asio::io_context& io_context, short port)
-    : m_acceptor(io_context, tcp::endpoint(tcp::v4(), port)) {
+Server::Server(asio::io_context& io_context, short port, asio::io_context& work_io)
+    : m_acceptor(io_context, tcp::endpoint(tcp::v4(), port)),
+      m_work_io(work_io) {
     Logger::getInstance().info("[SERVER] Listening on port " + std::to_string(port));
     do_accept();
 }
@@ -594,10 +720,11 @@ void Server::stop() {
 }
 
 void Server::do_accept() {
-    m_acceptor.async_accept(
-        [this](std::error_code ec, tcp::socket socket) {
+    auto socket = std::make_shared<tcp::socket>(m_work_io);
+    m_acceptor.async_accept(*socket,
+        [this, socket](std::error_code ec) {
             if (!ec && m_running) {
-                std::make_shared<Session>(std::move(socket))->start();
+                std::make_shared<Session>(std::move(*socket))->start();
             }
             if (m_running) {
                 do_accept();
@@ -611,25 +738,56 @@ void ServerApp::start(int port) {
     if (m_running) return;
     m_port = port;
 
-    m_io_context = std::make_unique<asio::io_context>();
-    m_work_guard.emplace(asio::make_work_guard(*m_io_context));
-    m_server = std::make_unique<Server>(*m_io_context, m_port);
+    m_accept_io = std::make_unique<asio::io_context>();
+    m_work_io = std::make_unique<asio::io_context>();
+    m_accept_guard.emplace(asio::make_work_guard(*m_accept_io));
+    m_work_guard.emplace(asio::make_work_guard(*m_work_io));
+    m_server = std::make_unique<Server>(*m_accept_io, m_port, *m_work_io);
 
-    m_thread = std::thread([this]() {
-        m_io_context->run();
-    });
+    m_thread_count = static_cast<int>(std::thread::hardware_concurrency());
+    if (m_thread_count < 2) m_thread_count = 2;
+    if (m_thread_count > 8) m_thread_count = 8;
+
+    m_threads.emplace_back([this]() { m_accept_io->run(); });
+    for (int i = 0; i < m_thread_count; ++i) {
+        m_threads.emplace_back([this]() { m_work_io->run(); });
+    }
+
     m_running = true;
-    Logger::getInstance().info("[SERVER] Started on port " + std::to_string(m_port));
+    Logger::getInstance().info("[SERVER] Started on port " + std::to_string(m_port) +
+        " with " + std::to_string(m_thread_count) + " worker threads");
 }
 
 void ServerApp::stop() {
     if (!m_running) return;
     m_running = false;
+
     if (m_server) m_server->stop();
+
+    uint64_t active = Server::activeSessionCount().load();
+    if (active > 0) {
+        Logger::getInstance().info("[SERVER] Waiting for " + std::to_string(active) + " active sessions...");
+        for (int i = 0; i < 100 && Server::activeSessionCount().load() > 0; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        uint64_t remaining = Server::activeSessionCount().load();
+        if (remaining > 0) {
+            Logger::getInstance().warn("[SERVER] " + std::to_string(remaining) + " sessions still active after 10s, forcing shutdown");
+        }
+    }
+
+    m_accept_guard.reset();
     m_work_guard.reset();
-    if (m_io_context) m_io_context->stop();
-    if (m_thread.joinable()) m_thread.join();
+    if (m_accept_io) m_accept_io->stop();
+    if (m_work_io) m_work_io->stop();
+
+    for (auto& t : m_threads) {
+        if (t.joinable()) t.join();
+    }
+    m_threads.clear();
+
     m_server.reset();
-    m_io_context.reset();
+    m_accept_io.reset();
+    m_work_io.reset();
     Logger::getInstance().info("[SERVER] Shutdown complete");
 }

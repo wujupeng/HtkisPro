@@ -1,6 +1,7 @@
 build/
 env/
 third_party/
+!third_party/nlohmann/
 *.exe
 *.obj
 *.user
@@ -19,3 +20,4 @@ users.txt
 *.lib
 *.exp
 *.dll
+.codeartsdoer/
