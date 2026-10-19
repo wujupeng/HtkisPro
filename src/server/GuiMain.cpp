@@ -772,6 +772,7 @@ static int RunD3D11Path() {
         g_d3dContext->ClearRenderTargetView(g_mainRenderTargetView, clear_color);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         g_swapChain->Present(1, 0);
+        Sleep(16);
     }
 
     // ===== Cleanup =====
@@ -826,7 +827,7 @@ static int RunGLFWPath() {
 
     // ===== Main Loop =====
     while (!g_shouldExit) {
-        glfwPollEvents();
+        glfwWaitEventsTimeout(1.0 / 60.0);
 #ifdef _WIN32
         ProcessTrayMessages();
 #endif
