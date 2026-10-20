@@ -4,7 +4,7 @@
 
 namespace LanProxy {
 
-    constexpr int DEFAULT_SERVER_PORT = 10800;
+    constexpr int DEFAULT_SERVER_PORT = 65510;
     constexpr int DEFAULT_CLIENT_PORT = 10801;
     
     // SOCKS5 constants

@@ -98,7 +98,7 @@ cmake -B build -S . -G "Visual Studio 17 2022" -A x64 -DOPENSSL_ROOT_DIR=C:/vcpk
 cmake --build build --config Release
 ```
 
-Output: `build/Release/proxy_server.exe` (statically linked, ~3MB)
+Output: `build/Release/proxy_server.exe` (statically linked, ~8.4MB)
 
 ### Build with Tests
 
@@ -142,7 +142,7 @@ src/
 ├── third_party/
 │   └── nlohmann/json.hpp         # JSON library (v3.11.3)
 └── tests/
-    └── unit/                     # GoogleTest unit tests (90 tests)
+    └── unit/                     # GoogleTest unit tests (155 tests)
 ```
 
 ## Supported Protocols
@@ -162,6 +162,8 @@ src/
 | Trojan | ✅ | TLS + SHA224 hash auth + traffic obfuscation |
 
 See [docs/protocol_guide.md](docs/protocol_guide.md) for protocol details.
+See [docs/crypto_protocol_guide.md](docs/crypto_protocol_guide.md) for crypto protocol configuration.
+See [docs/relay_nat_guide.md](docs/relay_nat_guide.md) for relay and NAT traversal setup.
 
 ## Log Format
 
@@ -191,3 +193,12 @@ Full session lifecycle logging:
 ## License
 
 Private - All rights reserved.
+## Version History
+
+| Version | Date | Highlights |
+|---------|------|------------|
+| v2.1.1 | 2026-10-20 | GUI localization fix: all panels (Config/Stats/Shadowsocks/VMess/VLESS/Trojan/Relay-NAT/Benchmark/TLS/CryptoStats) now fully support 6-language switching |
+| v2.1 | 2026-10-20 | Crypto protocols (SS/VMess/VLESS/Trojan), TLS/HTTPS, NAT traversal, relay tunnel, benchmark engine, 155 tests |
+| v2.0 | 2026-10-19 | Multi-protocol proxy with access control, rate limiting, connection pool, 90 tests |
+| v1.1 | 2026-10-15 | D3D11 fallback, font fix, encoding fix, static CRT |
+| v1.0 | 2026-10-14 | Initial release with HTTP/SOCKS/WebSocket proxy, GUI, user auth |
