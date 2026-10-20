@@ -7,6 +7,8 @@
 #include <unordered_map>
 #include <cstdint>
 #include <ctime>
+#include <map>
+#include "ProtocolDetector.h"
 
 struct UserStats {
     std::string username;
@@ -26,6 +28,21 @@ struct SessionInfo {
     uint64_t bytesDown = 0;
     std::time_t startTime = 0;
     bool active = true;
+    ProtocolType protocolType = ProtocolType::UNKNOWN;
+    std::string relayNodeId;
+};
+
+struct ProtocolStat {
+    uint32_t activeSessions = 0;
+    uint64_t bytesUp = 0;
+    uint64_t bytesDown = 0;
+};
+
+struct RelayStat {
+    uint32_t activeSessions = 0;
+    uint64_t bytesUp = 0;
+    uint64_t bytesDown = 0;
+    uint64_t latency = 0;
 };
 
 struct StatsSnapshot {
@@ -36,6 +53,14 @@ struct StatsSnapshot {
     uint32_t activeSessionCount = 0;
     std::vector<UserStats> userStats;
     std::vector<SessionInfo> activeSessions;
+    std::map<ProtocolType, ProtocolStat> protocolStats;
+    std::map<std::string, RelayStat> relayStats;
+};
+
+struct StabilitySnapshot {
+    double connectFailureRate = 0.0;
+    double authFailureRate = 0.0;
+    double abnormalDisconnectRate = 0.0;
 };
 
 class StatsCollector {
@@ -47,13 +72,19 @@ public:
 
     void onSessionStart(uint64_t sessionId, const std::string& username,
                         const std::string& protocol, const std::string& target,
-                        const std::string& clientAddr);
+                        const std::string& clientAddr,
+                        ProtocolType protocolType = ProtocolType::UNKNOWN,
+                        const std::string& relayNodeId = "");
     void onSessionUpdate(uint64_t sessionId, uint64_t deltaUp, uint64_t deltaDown);
     void onSessionClose(uint64_t sessionId, const std::string& reason);
 
     StatsSnapshot getSnapshot() const;
+    StabilitySnapshot getStabilitySnapshot() const;
     uint32_t getActiveSessionCount() const { return m_activeCount.load(); }
 
+    void recordConnectFailure();
+    void recordAuthFailure();
+    void recordAbnormalDisconnect();
     void compact();
 
 private:
@@ -71,4 +102,11 @@ private:
     std::atomic<uint64_t> m_globalBytesUp{0};
     std::atomic<uint64_t> m_globalBytesDown{0};
     std::atomic<uint64_t> m_nextSessionId{1};
+
+    std::atomic<uint64_t> m_connectFailures{0};
+    std::atomic<uint64_t> m_authFailures{0};
+    std::atomic<uint64_t> m_abnormalDisconnects{0};
+    std::atomic<uint64_t> m_totalConnects{0};
+    std::atomic<uint64_t> m_totalAuths{0};
+    std::atomic<uint64_t> m_totalDisconnects{0};
 };

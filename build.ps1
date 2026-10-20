@@ -38,7 +38,8 @@ if ($CleanBuild -and (Test-Path $BuildDir)) {
 # Configure
 Write-Host ""
 Write-Host "Configuring..." -ForegroundColor Cyan
-$CmakeArgs = @("-B", $BuildDir, "-S", $ProjectRoot, "-G", "Visual Studio 17 2022", "-A", "x64")
+$CmakeArgs = @("-B", $BuildDir, "-S", $ProjectRoot, "-G", "Visual Studio 17 2022", "-A", "x64",
+    "-DOPENSSL_ROOT_DIR=C:/vcpkg/installed/x64-windows-static")
 if ($BuildTesting) {
     $CmakeArgs += @("-DBUILD_TESTING=ON")
     Write-Host "  Testing enabled" -ForegroundColor Yellow

@@ -34,6 +34,12 @@
 #include "StatsCollector.h"
 #include "AuthFailureTracker.h"
 #include "DnsCache.h"
+#include "TlsContext.h"
+#include "RelayManager.h"
+#include "NatTraversalManager.h"
+#include "BenchmarkEngine.h"
+#include "StabilityMetrics.h"
+#include "BufferPool.h"
 #ifdef _WIN32
 #include "CrashHandler.h"
 #endif
@@ -415,6 +421,8 @@ static std::vector<std::pair<std::string, UserInfo>> s_users;
 static std::vector<LogEntry> s_logEntries;
 static bool s_autoScroll = true;
 
+static void RenderTlsPanel();
+
 // ===== Config Panel =====
 static void RenderConfigPanel() {
     auto cfg = Config::ConfigManager::getInstance().getSnapshot();
@@ -550,6 +558,11 @@ static void RenderConfigPanel() {
             ImGui::EndTabItem();
         }
 
+        if (ImGui::BeginTabItem("TLS")) {
+            RenderTlsPanel();
+            ImGui::EndTabItem();
+        }
+
         ImGui::EndTabBar();
     }
 }
@@ -608,6 +621,478 @@ static void RenderStatsPanel() {
     ImGui::Text("Cache Misses: %llu", (unsigned long long)DnsCache::getInstance().getMisses());
     if (ImGui::Button("Clear DNS Cache")) {
         DnsCache::getInstance().clear();
+    }
+}
+
+// ===== v2.1 GUI Panels =====
+
+
+static void RenderShadowsocksPanel() {
+    auto cfg = Config::ConfigManager::getInstance().getSnapshot();
+    static bool s_ss_enabled = cfg->shadowsocks.enabled;
+    static char s_ss_password[128] = {};
+    static int s_ss_method = 0;
+    static int s_ss_port = 8388;
+
+    ImGui::TextColored(ImVec4(0.6f, 0.7f, 0.85f, 1.0f), "Shadowsocks Configuration");
+    ImGui::Spacing();
+    ImGui::Checkbox("Enabled", &s_ss_enabled);
+    ImGui::Spacing();
+
+    ImGui::SetNextItemWidth(120);
+    ImGui::InputInt("Port", &s_ss_port);
+    if (s_ss_port < 1) s_ss_port = 1;
+    if (s_ss_port > 65535) s_ss_port = 65535;
+
+    ImGui::SetNextItemWidth(200);
+    ImGui::InputText("Password", s_ss_password, sizeof(s_ss_password), ImGuiInputTextFlags_Password);
+
+    const char* methods[] = {"AES-256-GCM", "AES-128-GCM", "ChaCha20-IETF-Poly1305"};
+    ImGui::SetNextItemWidth(180);
+    ImGui::Combo("Method", &s_ss_method, methods, 3);
+
+    ImGui::Spacing();
+    if (ImGui::Button("Apply", ImVec2(120, 28))) {
+        bool en = s_ss_enabled; int port = s_ss_port; const char* pwd = s_ss_password; int meth = s_ss_method;
+        Config::ConfigManager::getInstance().updateShadowsocks(
+            [en, port, pwd, meth](Config::ShadowsocksConfig& c) {
+                c.enabled = en;
+                Config::SsPortConfig pc;
+                pc.port = static_cast<uint16_t>(port);
+                pc.passwordHash = pwd;
+                pc.method = static_cast<Config::SsMethod>(meth);
+                c.ports.clear();
+                c.ports.push_back(pc);
+            });
+        Logger::getInstance().info("[GUI] Shadowsocks config applied");
+    }
+}
+
+static void RenderVmessPanel() {
+    auto cfg = Config::ConfigManager::getInstance().getSnapshot();
+    static bool s_vmess_enabled = cfg->vmess.enabled;
+    static int s_vmess_port = cfg->vmess.port;
+    static int s_vmess_alterId = cfg->vmess.alterId;
+    static char s_vmess_uuid[64] = {};
+
+    ImGui::TextColored(ImVec4(0.6f, 0.7f, 0.85f, 1.0f), "VMess Configuration");
+    ImGui::Spacing();
+    ImGui::Checkbox("Enabled", &s_vmess_enabled);
+    ImGui::Spacing();
+
+    ImGui::SetNextItemWidth(120);
+    ImGui::InputInt("Port", &s_vmess_port);
+    if (s_vmess_port < 1) s_vmess_port = 1;
+    if (s_vmess_port > 65535) s_vmess_port = 65535;
+
+    ImGui::SetNextItemWidth(300);
+    ImGui::InputText("UUID", s_vmess_uuid, sizeof(s_vmess_uuid));
+
+    const char* alterIds[] = {"0", "16"};
+    ImGui::SetNextItemWidth(80);
+    ImGui::Combo("alterId", &s_vmess_alterId, alterIds, 2);
+
+    ImGui::Spacing();
+    if (ImGui::Button("Apply", ImVec2(120, 28))) {
+        if (strlen(s_vmess_uuid) > 0 && !Config::isValidUuid(s_vmess_uuid)) {
+            Logger::getInstance().warn("[GUI] Invalid UUID format");
+        } else {
+            bool en = s_vmess_enabled; int port = s_vmess_port; const char* uuid = s_vmess_uuid; int aid = s_vmess_alterId;
+            Config::ConfigManager::getInstance().updateVmess(
+                [en, port, uuid, aid](Config::VmessConfig& c) {
+                    c.enabled = en;
+                    c.port = static_cast<uint16_t>(port);
+                    c.alterId = static_cast<uint8_t>(aid * 16);
+                    if (strlen(uuid) > 0) {
+                        c.uuids.clear();
+                        c.uuids.push_back(uuid);
+                    }
+                });
+            Logger::getInstance().info("[GUI] VMess config applied");
+        }
+    }
+}
+
+static void RenderVlessPanel() {
+    auto cfg = Config::ConfigManager::getInstance().getSnapshot();
+    static bool s_vless_enabled = cfg->vless.enabled;
+    static int s_vless_port = cfg->vless.port;
+    static int s_vless_transport = 0;
+    static char s_vless_uuid[64] = {};
+
+    ImGui::TextColored(ImVec4(0.6f, 0.7f, 0.85f, 1.0f), "VLESS Configuration");
+    ImGui::Spacing();
+    ImGui::Checkbox("Enabled", &s_vless_enabled);
+    ImGui::Spacing();
+
+    ImGui::SetNextItemWidth(120);
+    ImGui::InputInt("Port", &s_vless_port);
+    if (s_vless_port < 1) s_vless_port = 1;
+    if (s_vless_port > 65535) s_vless_port = 65535;
+
+    ImGui::SetNextItemWidth(300);
+    ImGui::InputText("UUID", s_vless_uuid, sizeof(s_vless_uuid));
+
+    const char* transports[] = {"TCP", "TLS", "WebSocket"};
+    ImGui::SetNextItemWidth(120);
+    ImGui::Combo("Transport", &s_vless_transport, transports, 3);
+
+    if (s_vless_transport == 0) {
+        ImGui::Spacing();
+        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "[Warning] TCP transport without TLS/WS is insecure!");
+    }
+
+    ImGui::Spacing();
+    if (ImGui::Button("Apply", ImVec2(120, 28))) {
+        if (strlen(s_vless_uuid) > 0 && !Config::isValidUuid(s_vless_uuid)) {
+            Logger::getInstance().warn("[GUI] Invalid UUID format");
+        } else {
+            bool en = s_vless_enabled; int port = s_vless_port; const char* uuid = s_vless_uuid; int tp = s_vless_transport;
+            Config::ConfigManager::getInstance().updateVless(
+                [en, port, uuid, tp](Config::VlessConfig& c) {
+                    c.enabled = en;
+                    c.port = static_cast<uint16_t>(port);
+                    c.transport = static_cast<Config::VlessTransport>(tp);
+                    if (strlen(uuid) > 0) {
+                        c.uuids.clear();
+                        c.uuids.push_back(uuid);
+                    }
+                });
+            Logger::getInstance().info("[GUI] VLESS config applied");
+        }
+    }
+}
+
+static void RenderTrojanPanel() {
+    auto cfg = Config::ConfigManager::getInstance().getSnapshot();
+    static bool s_trojan_enabled = cfg->trojan.enabled;
+    static int s_trojan_port = cfg->trojan.port;
+    static char s_trojan_password[128] = {};
+    static char s_trojan_cert[256] = {};
+    static char s_trojan_key[256] = {};
+
+    ImGui::TextColored(ImVec4(0.6f, 0.7f, 0.85f, 1.0f), "Trojan Configuration");
+    ImGui::Spacing();
+
+    bool tlsReady = TlsContext::getInstance().isReady();
+    if (!tlsReady) {
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "[TLS not configured] Trojan requires TLS certificate");
+        ImGui::Spacing();
+    }
+
+    ImGui::Checkbox("Enabled", &s_trojan_enabled);
+    if (!tlsReady) {
+        s_trojan_enabled = false;
+    }
+    ImGui::Spacing();
+
+    ImGui::SetNextItemWidth(120);
+    ImGui::InputInt("Port", &s_trojan_port);
+    if (s_trojan_port < 1) s_trojan_port = 1;
+    if (s_trojan_port > 65535) s_trojan_port = 65535;
+
+    ImGui::SetNextItemWidth(200);
+    ImGui::InputText("Password", s_trojan_password, sizeof(s_trojan_password), ImGuiInputTextFlags_Password);
+
+    ImGui::SetNextItemWidth(300);
+    ImGui::InputText("TLS Cert Path", s_trojan_cert, sizeof(s_trojan_cert));
+    ImGui::SetNextItemWidth(300);
+    ImGui::InputText("TLS Key Path", s_trojan_key, sizeof(s_trojan_key));
+
+    ImGui::Spacing();
+    if (ImGui::Button("Apply", ImVec2(120, 28))) {
+        bool en = s_trojan_enabled; int port = s_trojan_port; const char* pwd = s_trojan_password;
+        const char* cert = s_trojan_cert; const char* key = s_trojan_key;
+        Config::ConfigManager::getInstance().updateTrojan(
+            [en, port, pwd, cert, key](Config::TrojanConfig& c) {
+                c.enabled = en;
+                c.port = static_cast<uint16_t>(port);
+                c.tlsCertPath = cert;
+                c.tlsKeyPath = key;
+                if (strlen(pwd) > 0) {
+                    c.passwordHashes.clear();
+                    c.passwordHashes.push_back(pwd);
+                }
+            });
+        Logger::getInstance().info("[GUI] Trojan config applied");
+    }
+}
+
+static void RenderRelayNatPanel() {
+    auto cfg = Config::ConfigManager::getInstance().getSnapshot();
+
+    if (ImGui::BeginTabBar("##RelayNatTabs")) {
+        if (ImGui::BeginTabItem("Relay")) {
+            ImGui::TextColored(ImVec4(0.6f, 0.7f, 0.85f, 1.0f), "Relay Nodes");
+            ImGui::Spacing();
+
+            auto statuses = RelayManager::getInstance().getAllStatus();
+            if (statuses.empty()) {
+                ImGui::TextDisabled("No relay nodes configured");
+            } else {
+                if (ImGui::BeginTable("##RelayNodes", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+                    ImGui::TableSetupColumn("Node ID");
+                    ImGui::TableSetupColumn("State");
+                    ImGui::TableSetupColumn("Status");
+                    ImGui::TableHeadersRow();
+                    for (const auto& s : statuses) {
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::Text("%s", s.nodeId.c_str());
+                        ImGui::TableSetColumnIndex(1);
+                        const char* stateStr = "Unknown";
+                        switch (s.state) {
+                            case RelayTunnelClient::State::DISCONNECTED:   stateStr = "Disconnected"; break;
+                            case RelayTunnelClient::State::CONNECTING:     stateStr = "Connecting"; break;
+                            case RelayTunnelClient::State::AUTHENTICATING: stateStr = "Authing"; break;
+                            case RelayTunnelClient::State::ACTIVE:         stateStr = "Active"; break;
+                            case RelayTunnelClient::State::RECONNECTING:   stateStr = "Reconnecting"; break;
+                        }
+                        if (s.state == RelayTunnelClient::State::ACTIVE) {
+                            ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.4f, 1.0f), "%s", stateStr);
+                        } else {
+                            ImGui::TextColored(ImVec4(0.9f, 0.5f, 0.3f, 1.0f), "%s", stateStr);
+                        }
+                        ImGui::TableSetColumnIndex(2);
+                        ImGui::Text("up=%llu down=%llu", (unsigned long long)s.bytesUp, (unsigned long long)s.bytesDown);
+                    }
+                    ImGui::EndTable();
+                }
+            }
+
+            ImGui::Spacing();
+            static char s_relay_host[128] = {};
+            static int s_relay_port = 443;
+            static char s_relay_node_id[64] = {};
+            ImGui::SetNextItemWidth(200);
+            ImGui::InputText("Server Host", s_relay_host, sizeof(s_relay_host));
+            ImGui::SetNextItemWidth(80);
+            ImGui::InputInt("Server Port", &s_relay_port);
+            ImGui::SetNextItemWidth(120);
+            ImGui::InputText("Node ID", s_relay_node_id, sizeof(s_relay_node_id));
+            ImGui::Spacing();
+            if (ImGui::Button("Add Node", ImVec2(100, 25))) {
+                Config::RelayNodeConfig node;
+                node.nodeId = s_relay_node_id;
+                node.serverHost = s_relay_host;
+                node.serverPort = static_cast<uint16_t>(s_relay_port);
+                RelayManager::getInstance().addNode(node);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Remove Node", ImVec2(120, 25))) {
+                RelayManager::getInstance().removeNode(s_relay_node_id);
+            }
+
+            ImGui::EndTabItem();
+        }
+
+        if (ImGui::BeginTabItem("NAT")) {
+            ImGui::TextColored(ImVec4(0.6f, 0.7f, 0.85f, 1.0f), "NAT Traversal");
+            ImGui::Spacing();
+
+            static bool s_nat_enabled = cfg->nat.enabled;
+            static char s_stun_server[128] = {};
+            static int s_stun_port = 3478;
+            static int s_keepalive = 20;
+
+            ImGui::Checkbox("Enabled", &s_nat_enabled);
+            ImGui::Spacing();
+            ImGui::SetNextItemWidth(200);
+            ImGui::InputText("STUN Server", s_stun_server, sizeof(s_stun_server));
+            ImGui::SetNextItemWidth(80);
+            ImGui::InputInt("STUN Port", &s_stun_port);
+            ImGui::SetNextItemWidth(80);
+            ImGui::InputInt("Keepalive (s)", &s_keepalive);
+
+            ImGui::Spacing();
+            if (ImGui::Button("Probe Now", ImVec2(100, 25))) {
+                auto info = NatTraversalManager::getInstance().probeNow();
+                if (info) {
+                    Logger::getInstance().info("[GUI] NAT probe: type=" +
+                        Config::natTypeToString(info->type) + " " + info->publicIp + ":" + std::to_string(info->publicPort));
+                }
+            }
+
+            ImGui::Spacing();
+            if (NatTraversalManager::getInstance().isEnabled()) {
+                auto state = NatTraversalManager::getInstance().getCurrentState();
+                ImGui::Text("NAT Type: %s", Config::natTypeToString(state.type).c_str());
+                ImGui::Text("Public Address: %s:%u", state.publicIp.c_str(), state.publicPort);
+                if (state.type == Config::NatType::SYMMETRIC) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "[Warning] Symmetric NAT requires relay mode");
+                }
+            }
+
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+}
+
+static void RenderBenchmarkPanel() {
+    auto cfg = Config::ConfigManager::getInstance().getSnapshot();
+    static int s_concurrency = 100;
+    static int s_duration = 60;
+    static int s_protocol_idx = 0;
+    static char s_target_host[128] = "127.0.0.1";
+    static int s_target_port = 80;
+    static int s_connect_rate = 100;
+    static int s_mem_interval = 5;
+    static double s_progress = 0.0;
+    static std::string s_status;
+    static bool s_running = false;
+
+    ImGui::TextColored(ImVec4(0.6f, 0.7f, 0.85f, 1.0f), "Benchmark Engine");
+    ImGui::Spacing();
+
+    ImGui::SetNextItemWidth(100);
+    ImGui::InputInt("Concurrency", &s_concurrency);
+    ImGui::SetNextItemWidth(100);
+    ImGui::InputInt("Duration (s)", &s_duration);
+    const char* protocols[] = {"HTTP_CONNECT", "SOCKS5_TCP", "SHADOWSOCKS", "VMESS", "VLESS", "TROJAN"};
+    ImGui::SetNextItemWidth(150);
+    ImGui::Combo("Protocol", &s_protocol_idx, protocols, 6);
+    ImGui::SetNextItemWidth(200);
+    ImGui::InputText("Target Host", s_target_host, sizeof(s_target_host));
+    ImGui::SetNextItemWidth(80);
+    ImGui::InputInt("Target Port", &s_target_port);
+    ImGui::SetNextItemWidth(100);
+    ImGui::InputInt("Connect Rate", &s_connect_rate);
+    ImGui::SetNextItemWidth(100);
+    ImGui::InputInt("Mem Monitor Interval", &s_mem_interval);
+
+    ImGui::Spacing();
+    if (!s_running) {
+        if (ImGui::Button("Start Benchmark", ImVec2(150, 30))) {
+            s_running = true;
+            s_progress = 0.0;
+            Config::BenchmarkConfig bc;
+            bc.concurrency = s_concurrency;
+            bc.durationSeconds = s_duration;
+            bc.protocol = protocols[s_protocol_idx];
+            bc.targetHost = s_target_host;
+            bc.targetPort = static_cast<uint16_t>(s_target_port);
+            bc.connectRate = s_connect_rate;
+            bc.memoryMonitorInterval = s_mem_interval;
+
+            BenchmarkEngine::getInstance().run(bc,
+                [](double pct, const std::string& status) {
+                    s_progress = pct;
+                    s_status = status;
+                },
+                [](const BenchmarkReport& report) {
+                    s_running = false;
+                    Logger::getInstance().info("[BENCH] Throughput=" + std::to_string(report.throughputMbps) +
+                        " MB/s p99=" + std::to_string(report.p99HandshakeLatencyMs) + "ms");
+                },
+                [](const std::string& err) {
+                    s_running = false;
+                    Logger::getInstance().error("[BENCH] Error: " + err);
+                });
+        }
+    } else {
+        if (ImGui::Button("Cancel", ImVec2(100, 30))) {
+            BenchmarkEngine::getInstance().cancel();
+            s_running = false;
+        }
+        ImGui::SameLine();
+        ImGui::ProgressBar(static_cast<float>(s_progress / 100.0), ImVec2(200, 20));
+        ImGui::SameLine();
+        ImGui::Text("%s", s_status.c_str());
+    }
+}
+
+static void RenderTlsPanel() {
+    auto cfg = Config::ConfigManager::getInstance().getSnapshot();
+    static char s_cert_path[256] = {};
+    static char s_key_path[256] = {};
+    static int s_min_tls = 2;
+
+    ImGui::TextColored(ImVec4(0.6f, 0.7f, 0.85f, 1.0f), "TLS Certificate");
+    ImGui::Spacing();
+
+    bool tlsReady = TlsContext::getInstance().isReady();
+    if (tlsReady) {
+        ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.4f, 1.0f), "[TLS Ready]");
+    } else {
+        ImGui::TextColored(ImVec4(0.9f, 0.5f, 0.3f, 1.0f), "[TLS Not Configured]");
+    }
+    ImGui::Spacing();
+
+    ImGui::SetNextItemWidth(300);
+    ImGui::InputText("Cert Path", s_cert_path, sizeof(s_cert_path));
+    ImGui::SetNextItemWidth(300);
+    ImGui::InputText("Key Path", s_key_path, sizeof(s_key_path));
+
+    const char* tlsVersions[] = {"TLS 1.0", "TLS 1.1", "TLS 1.2", "TLS 1.3"};
+    ImGui::SetNextItemWidth(100);
+    ImGui::Combo("Min TLS Version", &s_min_tls, tlsVersions, 4);
+
+    ImGui::Spacing();
+    if (ImGui::Button("Load", ImVec2(80, 25))) {
+        std::string err;
+        if (TlsContext::getInstance().init(s_cert_path, s_key_path,
+                                           static_cast<Config::TlsVersion>(s_min_tls), err)) {
+            Logger::getInstance().info("[GUI] TLS certificate loaded successfully");
+        } else {
+            Logger::getInstance().error("[GUI] TLS load failed: " + err);
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Reload", ImVec2(80, 25))) {
+        std::string err;
+        if (TlsContext::getInstance().reload(err)) {
+            Logger::getInstance().info("[GUI] TLS certificate reloaded");
+        } else {
+            Logger::getInstance().error("[GUI] TLS reload failed: " + err);
+        }
+    }
+}
+
+static void RenderCryptoStatusPanel() {
+    ImGui::TextColored(ImVec4(0.6f, 0.7f, 0.85f, 1.0f), "Crypto Protocol Status");
+    ImGui::Spacing();
+
+    auto snap = StatsCollector::getInstance().getSnapshot();
+    if (snap.protocolStats.empty()) {
+        ImGui::TextDisabled("No crypto protocol activity");
+        return;
+    }
+
+    if (ImGui::BeginTable("##CryptoStats", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupColumn("Protocol");
+        ImGui::TableSetupColumn("Active Sessions");
+        ImGui::TableSetupColumn("Bytes Up");
+        ImGui::TableSetupColumn("Bytes Down");
+        ImGui::TableHeadersRow();
+        for (const auto& [type, stat] : snap.protocolStats) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::Text("%s", protocolTypeToString(type));
+            ImGui::TableSetColumnIndex(1);
+            ImGui::Text("%u", stat.activeSessions);
+            ImGui::TableSetColumnIndex(2);
+            ImGui::Text("%llu", (unsigned long long)stat.bytesUp);
+            ImGui::TableSetColumnIndex(3);
+            ImGui::Text("%llu", (unsigned long long)stat.bytesDown);
+        }
+        ImGui::EndTable();
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    ImGui::TextColored(ImVec4(0.6f, 0.7f, 0.85f, 1.0f), "Stability Metrics");
+    ImGui::Spacing();
+    auto stability = StabilityMetrics::getInstance().getSnapshot();
+    ImGui::Text("Connect Failure Rate: %.1f%%", stability.connectFailureRate);
+    ImGui::Text("Auth Failure Rate: %.1f%%", stability.authFailureRate);
+    ImGui::Text("Abnormal Disconnect Rate: %.1f%%", stability.abnormalDisconnectRate);
+    if (stability.alertLevel == "WARNING") {
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "[ALERT] %s", stability.alertLevel.c_str());
+    } else {
+        ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.4f, 1.0f), "[OK] %s", stability.alertLevel.c_str());
     }
 }
 
@@ -863,6 +1348,38 @@ static void RenderImGuiUI(int display_w, int display_h) {
             }
             if (ImGui::BeginTabItem("Stats")) {
                 RenderStatsPanel();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Shadowsocks")) {
+                RenderShadowsocksPanel();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("VMess")) {
+                RenderVmessPanel();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("VLESS")) {
+                RenderVlessPanel();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Trojan")) {
+                RenderTrojanPanel();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Relay/NAT")) {
+                RenderRelayNatPanel();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Benchmark")) {
+                RenderBenchmarkPanel();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("TLS")) {
+                RenderTlsPanel();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Crypto Stats")) {
+                RenderCryptoStatusPanel();
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();

@@ -100,6 +100,10 @@ const char* protocolTypeToString(ProtocolType type) {
         case ProtocolType::SOCKS5_TCP: return "SOCKS5 TCP";
         case ProtocolType::SOCKS5_UDP: return "SOCKS5 UDP";
         case ProtocolType::WEBSOCKET: return "WebSocket";
+        case ProtocolType::SHADOWSOCKS: return "Shadowsocks";
+        case ProtocolType::VMESS: return "VMess";
+        case ProtocolType::VLESS: return "VLESS";
+        case ProtocolType::TROJAN: return "Trojan";
         default: return "Unknown";
     }
 }

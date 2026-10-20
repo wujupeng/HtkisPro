@@ -3,7 +3,9 @@
 
 void StatsCollector::onSessionStart(uint64_t sessionId, const std::string& username,
                                      const std::string& protocol, const std::string& target,
-                                     const std::string& clientAddr) {
+                                     const std::string& clientAddr,
+                                     ProtocolType protocolType,
+                                     const std::string& relayNodeId) {
     std::lock_guard<std::mutex> lock(m_mutex);
     InternalSession s;
     s.sessionId = sessionId;
@@ -13,8 +15,11 @@ void StatsCollector::onSessionStart(uint64_t sessionId, const std::string& usern
     s.clientAddr = clientAddr;
     s.startTime = std::time(nullptr);
     s.lastRateTime = s.startTime;
+    s.protocolType = protocolType;
+    s.relayNodeId = relayNodeId;
     m_sessions[sessionId] = std::move(s);
     m_activeCount.fetch_add(1);
+    m_totalConnects.fetch_add(1);
 }
 
 void StatsCollector::onSessionUpdate(uint64_t sessionId, uint64_t deltaUp, uint64_t deltaDown) {
@@ -33,6 +38,7 @@ void StatsCollector::onSessionClose(uint64_t sessionId, const std::string& reaso
     if (it == m_sessions.end()) return;
     it->second.active = false;
     m_activeCount.fetch_sub(1);
+    m_totalDisconnects.fetch_add(1);
 }
 
 StatsSnapshot StatsCollector::getSnapshot() const {
@@ -55,6 +61,18 @@ StatsSnapshot StatsCollector::getSnapshot() const {
         us.bytesUp += s.bytesUp;
         us.bytesDown += s.bytesDown;
 
+        auto& ps = snap.protocolStats[s.protocolType];
+        ps.activeSessions++;
+        ps.bytesUp += s.bytesUp;
+        ps.bytesDown += s.bytesDown;
+
+        if (!s.relayNodeId.empty()) {
+            auto& rs = snap.relayStats[s.relayNodeId];
+            rs.activeSessions++;
+            rs.bytesUp += s.bytesUp;
+            rs.bytesDown += s.bytesDown;
+        }
+
         if (now > s.lastRateTime) {
             uint64_t rateUp = (s.bytesUp - s.lastBytesUp) / static_cast<uint64_t>(now - s.lastRateTime);
             uint64_t rateDown = (s.bytesDown - s.lastBytesDown) / static_cast<uint64_t>(now - s.lastRateTime);
@@ -70,6 +88,31 @@ StatsSnapshot StatsCollector::getSnapshot() const {
     }
 
     return snap;
+}
+
+StabilitySnapshot StatsCollector::getStabilitySnapshot() const {
+    StabilitySnapshot snap;
+    uint64_t totalConns = m_totalConnects.load();
+    uint64_t totalAuths = m_totalAuths.load();
+    uint64_t totalDisconns = m_totalDisconnects.load();
+    if (totalConns > 0) snap.connectFailureRate = static_cast<double>(m_connectFailures.load()) / totalConns;
+    if (totalAuths > 0) snap.authFailureRate = static_cast<double>(m_authFailures.load()) / totalAuths;
+    if (totalDisconns > 0) snap.abnormalDisconnectRate = static_cast<double>(m_abnormalDisconnects.load()) / totalDisconns;
+    return snap;
+}
+
+void StatsCollector::recordConnectFailure() {
+    m_connectFailures.fetch_add(1);
+    m_totalConnects.fetch_add(1);
+}
+
+void StatsCollector::recordAuthFailure() {
+    m_authFailures.fetch_add(1);
+    m_totalAuths.fetch_add(1);
+}
+
+void StatsCollector::recordAbnormalDisconnect() {
+    m_abnormalDisconnects.fetch_add(1);
 }
 
 void StatsCollector::compact() {

@@ -43,6 +43,9 @@ FetchContent_MakeAvailable(imgui)
 # Find OpenGL (optional, D3D11 fallback available)
 find_package(OpenGL)
 
+# Find OpenSSL (via vcpkg, requires -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake)
+find_package(OpenSSL REQUIRED)
+
 set(IMGUI_SOURCES
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
@@ -75,6 +78,36 @@ add_executable(proxy_server
     src/server/RateLimiter.cpp
     src/server/QosScheduler.cpp
     src/server/StatsCollector.cpp
+    src/server/TlsContext.cpp
+    src/server/HttpsHandler.cpp
+    src/server/AeadCipher.cpp
+    src/server/SsKeyDerivation.cpp
+    src/server/AesCfbCipher.cpp
+    src/server/CryptoSessionBase.cpp
+    src/server/ShadowsocksSession.cpp
+    src/server/ShadowsocksHandler.cpp
+    src/server/SsMultiPortListener.cpp
+    src/server/VmessSession.cpp
+    src/server/VmessHeaderDecoder.cpp
+    src/server/VmessChunkCodec.cpp
+    src/server/VmessHandler.cpp
+    src/server/VlessSession.cpp
+    src/server/VlessHeaderParser.cpp
+    src/server/VlessHandler.cpp
+    src/server/TrojanSession.cpp
+    src/server/TrojanHashAuth.cpp
+    src/server/TrojanHandler.cpp
+    src/server/StunClient.cpp
+    src/server/NatTraversalManager.cpp
+    src/server/RelayTunnelClient.cpp
+    src/server/RelayManager.cpp
+    src/server/RelayConfigStore.cpp
+    src/server/RelaySessionRouter.cpp
+    src/server/MemoryMonitor.cpp
+    src/server/StabilityMetrics.cpp
+    src/server/BufferPool.cpp
+    src/server/BenchmarkEngine.cpp
+    src/server/BenchmarkWorker.cpp
     src/common/Localization.cpp
     src/common/Config.cpp
     src/common/ConfigManager.cpp
@@ -109,8 +142,9 @@ if(OpenGL_FOUND)
     target_compile_definitions(proxy_server PRIVATE HAS_OPENGL)
 endif()
 if(WIN32)
-    target_link_libraries(proxy_server PRIVATE gdiplus d3d11 dxgi d3dcompiler)
+    target_link_libraries(proxy_server PRIVATE gdiplus d3d11 dxgi d3dcompiler crypt32)
 endif()
+target_link_libraries(proxy_server PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 # ─── Testing ───
 option(BUILD_TESTING "Build unit tests" OFF)
 if(BUILD_TESTING)

@@ -9,6 +9,19 @@ set(TEST_SOURCES
     unit/test_HashUtil.cpp
     unit/test_ProtocolDetector.cpp
     unit/test_WebSocketFrame.cpp
+    unit/test_AeadCipher.cpp
+    unit/test_SsKeyDerivation.cpp
+    unit/test_AesCfbCipher.cpp
+    unit/test_VmessHeaderDecoder.cpp
+    unit/test_VmessChunkCodec.cpp
+    unit/test_VlessHeaderParser.cpp
+    unit/test_TrojanHashAuth.cpp
+    unit/test_BufferPool.cpp
+    unit/test_StabilityMetrics.cpp
+    unit/test_MemoryMonitor.cpp
+    unit/test_CryptoConfig.cpp
+    unit/test_CryptoProtocolIntegration.cpp
+    unit/test_PerfRegression.cpp
 )
 
 set(CORE_SOURCES
@@ -23,6 +36,16 @@ set(CORE_SOURCES
     ../src/server/AuthFailureTracker.cpp
     ../src/server/ProtocolDetector.cpp
     ../src/server/WebSocketFrame.cpp
+    ../src/server/AeadCipher.cpp
+    ../src/server/SsKeyDerivation.cpp
+    ../src/server/AesCfbCipher.cpp
+    ../src/server/VmessHeaderDecoder.cpp
+    ../src/server/VmessChunkCodec.cpp
+    ../src/server/VlessHeaderParser.cpp
+    ../src/server/TrojanHashAuth.cpp
+    ../src/server/BufferPool.cpp
+    ../src/server/StabilityMetrics.cpp
+    ../src/server/MemoryMonitor.cpp
 )
 
 add_executable(proxy_tests ${TEST_SOURCES} ${CORE_SOURCES})
@@ -42,8 +65,10 @@ target_link_libraries(proxy_tests PRIVATE
 )
 
 if(WIN32)
-    target_link_libraries(proxy_tests PRIVATE bcrypt crypt32 ws2_32)
+    target_link_libraries(proxy_tests PRIVATE bcrypt crypt32 ws2_32 psapi)
 endif()
+
+target_link_libraries(proxy_tests PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 
 # Apply static CRT to tests too
 if(MSVC)

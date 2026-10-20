@@ -12,6 +12,8 @@
 #include <thread>
 #include <atomic>
 #include <optional>
+#include "ProtocolDetector.h"
+
 
 class Session : public std::enable_shared_from_this<Session> {
 public:
@@ -59,6 +61,7 @@ private:
 
     // Target info (used by both HTTP and SOCKS5)
     bool m_is_http{false};
+    ProtocolType m_protocol{ProtocolType::UNKNOWN};
     std::string m_target_host;
     uint16_t m_target_port{0};
 
@@ -112,6 +115,10 @@ private:
     ServerApp() = default;
     ~ServerApp() { stop(); }
 
+    void startCryptoListeners();
+    void stopCryptoListeners();
+    bool checkPortConflict(uint16_t port);
+
     std::atomic<bool> m_running{false};
     int m_port{65510};
 
@@ -122,4 +129,9 @@ private:
     std::unique_ptr<Server> m_server;
     std::vector<std::thread> m_threads;
     int m_thread_count{0};
+
+    std::shared_ptr<class SsMultiPortListener> m_ss_listener;
+    std::shared_ptr<class VmessHandler> m_vmess_handler;
+    std::shared_ptr<class VlessHandler> m_vless_handler;
+    std::shared_ptr<class TrojanHandler> m_trojan_handler;
 };

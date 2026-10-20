@@ -8,7 +8,7 @@
 [![License](https://img.shields.io/badge/license-Private-red.svg)](LICENSE)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://isocpp.org/std/the-standard)
 
-A lightweight, secure proxy server with user authentication, real-time logging, and a modern dark-themed GUI. Supports HTTP CONNECT, SOCKS4/4a, SOCKS5 TCP/UDP, and WebSocket protocols on a single port.
+A lightweight, secure proxy server with user authentication, real-time logging, and a modern dark-themed GUI. Supports HTTP CONNECT, SOCKS4/4a, SOCKS5 TCP/UDP, WebSocket, HTTPS, Shadowsocks, VMess, VLESS, and Trojan protocols.
 
 </div>
 
@@ -16,7 +16,11 @@ A lightweight, secure proxy server with user authentication, real-time logging, 
 
 ## Features
 
-- **Multi-Protocol** - Auto-detects HTTP CONNECT, SOCKS4/4a, SOCKS5 TCP/UDP, and WebSocket on the same port
+- **Multi-Protocol** - Auto-detects HTTP CONNECT, SOCKS4/4a, SOCKS5 TCP/UDP, WebSocket, HTTPS on the same port
+- **Crypto Protocols** - Shadowsocks (AEAD), VMess, VLESS, Trojan on independent ports
+- **TLS/HTTPS** - TLS context with certificate loading, hot reload, HTTPS proxy support
+- **NAT Traversal** - STUN-based NAT type detection, keepalive, relay tunnel with auto-reconnect
+- **Benchmark Engine** - Built-in performance benchmarking with memory monitoring
 - **User Authentication** - SHA-256 + salt password hashing, configurable expiration, brute-force protection
 - **IP Access Control** - Whitelist/blacklist with CIDR notation, IPv4/IPv6 dual-stack
 - **Rate Limiting** - Global and per-user bandwidth limits with 10% burst capacity
@@ -70,17 +74,27 @@ Users are stored in `users.json` with SHA-256 + salt hashing. Legacy `users.txt`
 - CMake 3.14+
 - Visual Studio 2022 (MSVC, with C++17 support)
 - Git (for FetchContent dependencies)
+- OpenSSL 3.x (via vcpkg, static build)
 
 Dependencies are automatically downloaded via CMake FetchContent:
 - [asio](https://github.com/chriskohlhoff/asio) (standalone)
 - [GLFW](https://github.com/glfw/glfw) 3.4
 - [Dear ImGui](https://github.com/ocornut/imgui) v1.91.6
 - [nlohmann/json](https://github.com/nlohmann/json) v3.11.3 (included in third_party/)
+- [OpenSSL](https://www.openssl.org/) 3.x (via vcpkg static)
+
+### Install OpenSSL via vcpkg
+
+```bash
+git clone https://github.com/microsoft/vcpkg.git C:/vcpkg
+C:/vcpkg/bootstrap-vcpkg.bat
+C:/vcpkg/vcpkg install openssl:x64-windows-static
+```
 
 ### Build
 
 ```bash
-cmake -B build -S . -G "Visual Studio 17 2022" -A x64
+cmake -B build -S . -G "Visual Studio 17 2022" -A x64 -DOPENSSL_ROOT_DIR=C:/vcpkg/installed/x64-windows-static
 cmake --build build --config Release
 ```
 
@@ -89,7 +103,7 @@ Output: `build/Release/proxy_server.exe` (statically linked, ~3MB)
 ### Build with Tests
 
 ```bash
-cmake -B build -S . -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=ON
+cmake -B build -S . -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=ON -DOPENSSL_ROOT_DIR=C:/vcpkg/installed/x64-windows-static
 cmake --build build --config Release
 ctest --test-dir build --config Release
 ```
@@ -141,7 +155,11 @@ src/
 | SOCKS5 TCP | ✅ | SOCKS5 CONNECT (IPv4/Domain/IPv6) |
 | SOCKS5 UDP | ✅ | SOCKS5 UDP ASSOCIATE |
 | WebSocket | ✅ | WS tunnel (Upgrade handshake) |
-| HTTPS | ⏳ | TLS proxy (requires OpenSSL, planned) |
+| HTTPS | ✅ | TLS proxy (requires OpenSSL certificate) |
+| Shadowsocks | ✅ | AEAD (AES-256-GCM, AES-128-GCM, ChaCha20-Poly1305) |
+| VMess | ✅ | V2Ray VMess (AES-128-CFB header + AEAD chunks) |
+| VLESS | ✅ | V2Ray VLESS (plaintext header, outer TLS) |
+| Trojan | ✅ | TLS + SHA224 hash auth + traffic obfuscation |
 
 See [docs/protocol_guide.md](docs/protocol_guide.md) for protocol details.
 

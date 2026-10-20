@@ -5,10 +5,17 @@
 #include "IpAcl.h"
 #include "ConfigManager.h"
 #include "ProtocolDetector.h"
+#include "TlsContext.h"
+#include "HttpsHandler.h"
+#include "SsMultiPortListener.h"
+#include "VmessHandler.h"
+#include "VlessHandler.h"
+#include "TrojanHandler.h"
 #include <iostream>
 #include <cstring>
 #include <string_view>
 #include <chrono>
+#include <unordered_set>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -116,8 +123,15 @@ void Session::do_handshake() {
                         handle_socks4_handshake(length);
                         break;
                     case ProtocolType::HTTPS:
-                        Logger::getInstance().warn("[HANDSHAKE] TLS not yet supported from " + m_client_addr);
-                        close_session("tls not supported");
+                        if (TlsContext::getInstance().isReady()) {
+                            Logger::getInstance().info("[HANDSHAKE] HTTPS detected from " + m_client_addr + ", delegating to HttpsHandler");
+                            auto tlsCtx = TlsContext::getInstance().get();
+                            auto handler = std::make_shared<HttpsHandler>(std::move(m_client_socket), tlsCtx);
+                            handler->start();
+                        } else {
+                            Logger::getInstance().warn("[HANDSHAKE] HTTPS detected but TLS not configured from " + m_client_addr);
+                            close_session("tls not configured");
+                        }
                         break;
                     case ProtocolType::WEBSOCKET:
                         Logger::getInstance().warn("[HANDSHAKE] WebSocket not yet supported from " + m_client_addr);
@@ -756,11 +770,15 @@ void ServerApp::start(int port) {
     m_running = true;
     Logger::getInstance().info("[SERVER] Started on port " + std::to_string(m_port) +
         " with " + std::to_string(m_thread_count) + " worker threads");
+
+    startCryptoListeners();
 }
 
 void ServerApp::stop() {
     if (!m_running) return;
     m_running = false;
+
+    stopCryptoListeners();
 
     if (m_server) m_server->stop();
 
@@ -790,4 +808,68 @@ void ServerApp::stop() {
     m_accept_io.reset();
     m_work_io.reset();
     Logger::getInstance().info("[SERVER] Shutdown complete");
+}
+bool ServerApp::checkPortConflict(uint16_t port) {
+    static std::unordered_set<uint16_t> usedPorts;
+    if (port == static_cast<uint16_t>(m_port)) return true;
+    if (usedPorts.count(port)) return true;
+    usedPorts.insert(port);
+    return false;
+}
+
+void ServerApp::startCryptoListeners() {
+    auto cfg = Config::ConfigManager::getInstance().getSnapshot();
+
+    if (cfg->shadowsocks.enabled && !cfg->shadowsocks.ports.empty()) {
+        bool hasConflict = false;
+        for (const auto& p : cfg->shadowsocks.ports) {
+            if (checkPortConflict(p.port)) {
+                Logger::getInstance().warn("[SERVER] SS port " + std::to_string(p.port) + " conflicts, skipping");
+                hasConflict = true;
+            }
+        }
+        if (!hasConflict) {
+            m_ss_listener = std::make_shared<SsMultiPortListener>(*m_work_io);
+            m_ss_listener->start(cfg->shadowsocks.ports);
+        }
+    }
+
+    if (cfg->vmess.enabled && !cfg->vmess.uuids.empty()) {
+        if (cfg->vmess.alterId > 16) {
+            Logger::getInstance().warn("[SERVER] VMess alterId > 16 is not supported, skipping VMess");
+        } else if (!checkPortConflict(cfg->vmess.port)) {
+            m_vmess_handler = std::make_shared<VmessHandler>(*m_work_io, cfg->vmess.port, cfg->vmess.uuids, cfg->vmess.alterId);
+            m_vmess_handler->start();
+        } else {
+            Logger::getInstance().warn("[SERVER] VMess port " + std::to_string(cfg->vmess.port) + " conflicts, skipping");
+        }
+    }
+
+    if (cfg->vless.enabled && !cfg->vless.uuids.empty()) {
+        if (!checkPortConflict(cfg->vless.port)) {
+            m_vless_handler = std::make_shared<VlessHandler>(*m_work_io, cfg->vless.port, cfg->vless.uuids);
+            m_vless_handler->start();
+        } else {
+            Logger::getInstance().warn("[SERVER] VLESS port " + std::to_string(cfg->vless.port) + " conflicts, skipping");
+        }
+    }
+
+    if (cfg->trojan.enabled && !cfg->trojan.passwordHashes.empty()) {
+        if (!TlsContext::getInstance().isReady()) {
+            Logger::getInstance().warn("[SERVER] Trojan requires TLS but TLS not configured, skipping");
+        } else if (!checkPortConflict(cfg->trojan.port)) {
+            auto tlsCtx = TlsContext::getInstance().get();
+            m_trojan_handler = std::make_shared<TrojanHandler>(*m_work_io, cfg->trojan.port, tlsCtx, cfg->trojan.passwordHashes);
+            m_trojan_handler->start();
+        } else {
+            Logger::getInstance().warn("[SERVER] Trojan port " + std::to_string(cfg->trojan.port) + " conflicts, skipping");
+        }
+    }
+}
+
+void ServerApp::stopCryptoListeners() {
+    if (m_ss_listener) { m_ss_listener->stop(); m_ss_listener.reset(); }
+    if (m_vmess_handler) { m_vmess_handler->stop(); m_vmess_handler.reset(); }
+    if (m_vless_handler) { m_vless_handler->stop(); m_vless_handler.reset(); }
+    if (m_trojan_handler) { m_trojan_handler->stop(); m_trojan_handler.reset(); }
 }

@@ -12,7 +12,24 @@ enum class ProtocolType {
     SOCKS5_TCP,
     SOCKS5_UDP,
     WEBSOCKET,
+    SHADOWSOCKS,
+    VMESS,
+    VLESS,
+    TROJAN,
     UNKNOWN
+};
+
+enum class SessionEndReason {
+    ClientDisconnect,
+    RemoteDisconnect,
+    Timeout,
+    AuthFailed,
+    ConnectFailed,
+    AclDenied,
+    RateLimitExceeded,
+    RelayDisconnect,
+    Error,
+    Unknown
 };
 
 class ProtocolDetector {
